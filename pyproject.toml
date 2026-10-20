@@ -1,0 +1,26 @@
+[project]
+name = "lorrext"
+version = "0.1.0"
+description = "LoRR-Ext: League of Robot Runners with known arrival processes, interval service times and latency/deadline metrics"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "matplotlib>=3.7",
+    "scipy>=1.10",
+    "streamlit>=1.38",
+    "tabulate>=0.10.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["lorrext"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

@@ -1,0 +1,10 @@
+third_party/
+kits/
+runs/
+instances/base/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
