@@ -2,12 +2,14 @@
 
 LoRR-Ext is a testbed that asks **how much of a solver's leaderboard throughput is actually usable once tasks must finish within a deadline**. It extends the [League of Robot Runners](https://www.leagueofrobotrunners.org/) (LoRR) Start-Kit with three things the competition doesn't model:
 
-1. **Known arrival processes.** Tasks arrive from a known Poisson, bursty two-state (Markov-modulated Poisson, MMPP) or self-exciting (Hawkes) process, instead of from the competition's always-full task pool.
-2. **Interval service times.** Each errand needs the robot to stay on the cell for a hidden duration drawn from a *known* interval (the "kitchen" case: 2–4 ticks to pick up, 10–30 ticks to cook or hand over).
+1. **Known arrival processes (optional).** The default is the competition's always-full task pool. For benchmarking, tasks can instead arrive from a known Poisson, bursty two-state (Markov-modulated Poisson, MMPP) or self-exciting (Hawkes) process.
+2. **Uncertain service times.** Each errand needs the robot to stay on the cell for a hidden duration drawn from a *known* distribution: a uniform interval (`2-4`), or `lognormal`, `gamma`, `exponential`, `normal` or `fixed` with a given mean and coefficient of variation (e.g. `lognormal:20:0.5`). The "kitchen" presets are `kitchen` (2–4 ticks to pick up, 10–30 to cook or hand over) and `kitchen_dist` (the same means as lognormal distributions).
 3. **Latency and deadline metrics.** Each task's latency is recorded, along with deadline-miss rates and 99th-percentile latency (tasks still open count as misses), and from these a single gap metric.
 
 The same patch applies to the 2026 Start-Kit (v3.1.0) and to archived 2024-season entries. When the new settings are absent, every kit behaves exactly as released.
 
+> **New here? Start with the illustrated guide [`docs/explainer.md`](docs/explainer.md)**: problem formulation, environment, each algorithm, and every metric, with figures and code pointers.
+>
 > Origin: this repo reproduces, checks and corrects a benchmark first built in a claude.ai research chat. [What changed relative to that chat](#what-the-original-chat-got-right-and-wrong) is listed below.
 
 ## Quick start
@@ -15,7 +17,7 @@ The same patch applies to the 2026 Start-Kit (v3.1.0) and to archived 2024-seaso
 ```bash
 bash scripts/setup.sh                       # clone Start-Kit + 2024 entries, patch, build (≈5 min)
 uv sync                                     # Python deps (analysis, UI, videos)
-uv run pytest -q                            # 12 tests, incl. an end-to-end simulation
+uv run pytest -q                            # 20 tests, incl. end-to-end simulations
 python3 -m lorrext.bench --out runs/bench   # 616-run grid (≈65 min on 10 cores)
 uv run python -m lorrext.analyze --runs runs/bench --out results
 uv run python -m lorrext.videos             # side-by-side replay videos
@@ -48,15 +50,18 @@ Turned on by a `lorrExt` object in the instance JSON:
 "lorrExt": {
   "arrival":  {"model": "mmpp", "rate": 0.3, "seed": 0,
                "burstFactor": 4.0, "burstFraction": 0.2, "burstLength": 50},
-  "service":  {"intervals": [[2, 4], [10, 30]], "seed": 0},
+  "service":  {"stops": [{"dist": "uniform", "lo": 2, "hi": 4},
+                         {"dist": "lognormal", "mean": 20, "cv": 0.5, "min": 1, "max": 200}],
+               "seed": 0, "planQuantile": 0.95},
   "deadline": 300,
   "scheduler": "fifo"
 }
 ```
 
 * **Arrivals.** The model is one of `pool` (the original kit), `poisson`, `mmpp` or `hawkes`. All models have the same long-run mean `rate`. Arrivals come from a dedicated random stream, so every solver sees identical task arrivals for a given seed (this is tested). Task contents still come from the task file, in order.
-* **Service.** Errand *j* of a task uses interval `intervals[j mod n]`. The realised duration is a hash of (seed, task, errand), so it doesn't depend on solver behaviour. A robot must accumulate that many ticks on the cell. Being pushed off pauses the clock, and the clock restarts if a different robot takes the errand over. Schedulers can read the known interval through `LorrExt::service_interval()`; the realised value stays hidden.
+* **Service.** Errand *j* of a task uses `stops[j mod n]` (`intervals: [[lo, hi], ...]` is accepted as shorthand). The realised duration is drawn from a generator seeded by (seed, task, errand), so it doesn't depend on solver behaviour. A robot must accumulate that many ticks on the cell. Being pushed off pauses the clock, and the clock restarts if a different robot takes the errand over. Schedulers can read the known distribution through `LorrExt::service_mean()` and `LorrExt::service_quantile()`; the realised value stays hidden.
 * **Records.** The output JSON gets `lorrExt.tasks = [[id, revealed, completed (-1 = open), agent, n_errands], ...]`.
+* **Metrics** (see the explainer, §4): throughput; latency mean/p50/p99/max; CVaR95; deadline-miss rate and p99 at several deadlines; normalised latency (stretch); mean open tasks; and, across a sweep, deadline-feasible capacity and the SLA gap.
 
 ### Hooks (what `tools/patch_kit.py` changes)
 

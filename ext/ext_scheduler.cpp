@@ -4,9 +4,9 @@
 //   default : the kit's greedy scheduler (each free robot takes its
 //             shortest task), untouched
 //   fifo    : oldest open task first, each given to the nearest free robot
-//   slack   : least slack first, slack = deadline - (age + travel of the
-//             nearest free robot + errand path + worst-case service) using
-//             the *known* service intervals
+//   slack   : least slack first, slack = deadline - (age + errand path +
+//             safe service), where safe service is a quantile (default 95th
+//             percentile) of the *known* service-time distributions
 //   stage   : fifo, plus idle robots are sent to (parked on) the start
 //             errand of recently revealed tasks
 //   stage_near : like stage, but parks on a free cell next to that errand
@@ -41,11 +41,13 @@ static int path_len(SharedEnvironment *env, const Task &t, int from)
     return d;
 }
 
-static int worst_service(const Task &t)
+// "safe" remaining service: the planQuantile (default 95th percentile) of
+// each remaining errand's known duration distribution
+static int safe_service(const Task &t)
 {
     int s = 0;
     for (size_t j = std::max(0, t.idx_next_loc); j < t.locations.size(); j++)
-        s += LorrExt::service_interval(int(j)).second;
+        s += LorrExt::service_quantile(int(j), LorrExt::cfg().serviceQuantile);
     return s;
 }
 
@@ -110,7 +112,7 @@ bool plan(int time_limit, std::vector<int> &proposed_schedule, SharedEnvironment
             // travel of the nearest free robot is added below per-robot;
             // here the robot-independent part keeps sorting cheap
             int age = now - t.t_revealed;
-            key = (long long)D - age - path_len(env, t, t.locations.front()) - worst_service(t);
+            key = (long long)D - age - path_len(env, t, t.locations.front()) - safe_service(t);
         }
         order.emplace_back(key, kv.first);
     }

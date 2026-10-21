@@ -39,6 +39,30 @@ def sample(s: Setting, T: int | None = None, seed: int | None = None) -> np.ndar
     raise ValueError(f"no preview for arrival model {s.arrival!r}")
 
 
+def service_samples(stop: dict, n: int = 20000, seed: int = 0) -> np.ndarray:
+    """Draw service times (ticks) from one parsed errand slot, mirroring
+    ServiceDist::draw in ext/lorr_ext.h (rounded, clamped)."""
+    rng = np.random.default_rng(seed)
+    d, mean, cv = stop["dist"], stop.get("mean", 0.0), stop.get("cv", 0.0)
+    if d == "uniform":
+        return rng.integers(stop["lo"], stop["hi"] + 1, n)
+    if d == "fixed":
+        x = np.full(n, mean)
+    elif d == "exponential":
+        x = rng.exponential(mean, n)
+    elif d == "lognormal":
+        s2 = np.log(1 + cv * cv)
+        x = rng.lognormal(np.log(mean) - s2 / 2, np.sqrt(s2), n)
+    elif d == "gamma":
+        k = 1 / max(cv * cv, 1e-9)
+        x = rng.gamma(k, mean / k, n)
+    elif d == "normal":
+        x = rng.normal(mean, mean * cv, n)
+    else:
+        raise ValueError(d)
+    return np.clip(np.round(x), stop.get("min", 0.0), stop.get("max", 1e9)).astype(int)
+
+
 def burst_stats(x: np.ndarray, window: int = 50) -> dict:
     w = np.convolve(x, np.ones(window, dtype=int), mode="valid")
     return {"mean_rate": float(x.mean()), f"max_in_{window}": int(w.max()),

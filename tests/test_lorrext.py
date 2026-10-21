@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from lorrext import arrivals
-from lorrext.core import KITS, ROOT, Setting, deadline_metrics, metrics, run, service_intervals
+from lorrext.core import KITS, ROOT, Setting, deadline_metrics, metrics, run, service_intervals, service_stops
 from lorrext.replay import load, parse_actions, validate
 
 TP = ROOT / "third_party"
@@ -18,6 +18,26 @@ def test_service_intervals():
     assert service_intervals("none") == []
     assert service_intervals("kitchen") == [[2, 4], [10, 30]]
     assert service_intervals("3-5;10-20") == [[3, 5], [10, 20]]
+
+
+def test_service_distribution_spec():
+    assert service_stops("lognormal:20:0.5") == [{"dist": "lognormal", "mean": 20.0, "cv": 0.5}]
+    assert service_stops("exponential:3")[0]["cv"] == 1.0
+    assert service_stops("2-4;gamma:20:0.5:1:120")[1] == {"dist": "gamma", "mean": 20.0, "cv": 0.5, "min": 1.0, "max": 120.0}
+    with pytest.raises(ValueError):
+        service_stops("weibull:3")
+
+
+@pytest.mark.parametrize("spec", ["lognormal:20:0.5", "gamma:20:0.5", "exponential:20", "normal:20:0.3", "2-4"])
+def test_service_sampler_mean(spec):
+    stop = service_stops(spec)[0]
+    x = arrivals.service_samples(stop, n=100_000, seed=1)
+    target = (stop["lo"] + stop["hi"]) / 2 if stop["dist"] == "uniform" else stop["mean"]
+    assert abs(x.mean() - target) < 0.05 * target + 0.1
+
+
+def test_default_arrival_is_pool():
+    assert Setting().arrival == "pool"
 
 
 def test_setting_key_only_shows_non_defaults():
@@ -107,6 +127,25 @@ def test_simulation_end_to_end(tmp_path):
         on = sum(tuple(rp.pos[u, a]) == tuple(loc) for u in range(start + 1, t + 1))
         assert on >= iv[(seq - 1) % 2][0]
         prev[tid] = t
+
+
+@needs_kit
+def test_service_distribution_end_to_end(tmp_path):
+    """C++ quantiles match the Python sampler, and robots dwell accordingly."""
+    s = Setting(arrival="pool", service="lognormal:20:0.5", steps=300, seed=1)
+    r = run("fifo2026", s, tmp_path, screen=1)
+    js = json.loads(Path(r["output"]).read_text())
+    q = js["lorrExt"]["service"][0]
+    py = arrivals.service_samples(service_stops(s.service)[0])
+    assert abs(q["q50"] - np.percentile(py, 50)) <= 1 and abs(q["q95"] - np.percentile(py, 95)) <= 2
+    rp = load(Path(r["output"]))
+    prev, dwell = {}, []
+    for t, a, tid, seq in sorted(rp.events):
+        loc = rp.tasks[tid]["locs"][seq - 1]
+        start = prev.get(tid, rp.tasks[tid]["reveal"])
+        dwell.append(sum(tuple(rp.pos[u, a]) == tuple(loc) for u in range(start + 1, t + 1)))
+        prev[tid] = t
+    assert len(dwell) > 50 and abs(np.median(dwell) - q["q50"]) <= 3
 
 
 @needs_kit

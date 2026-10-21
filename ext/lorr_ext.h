@@ -21,12 +21,86 @@
 #include <cstdint>
 #include <list>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "nlohmann/json.hpp"
+
+// Known distribution of one errand's service (dwell) time, in ticks.
+//   uniform    : integer U{lo, hi} (the "interval" setting)
+//   exponential: mean                      (cv is 1 by definition)
+//   lognormal  : mean, cv                  (right-skewed, never negative)
+//   gamma      : mean, cv                  (shape 1/cv^2)
+//   normal     : mean, cv, truncated at min
+//   fixed      : mean                      (deterministic)
+// Draws are rounded to whole ticks and clamped to [min, max].
+struct ServiceDist
+{
+    std::string type = "uniform";
+    double lo = 0, hi = 0;       // uniform
+    double mean = 0, cv = 0;     // others
+    double min = 0, max = 1e9;
+    std::vector<int> qtable;     // empirical quantiles q = 0, 0.001, ..., 1
+
+    template <class RNG>
+    double draw_raw(RNG &g) const
+    {
+        if (type == "uniform")
+            return std::uniform_int_distribution<int>(int(lo), int(hi))(g);
+        if (type == "fixed")
+            return mean;
+        if (type == "exponential")
+            return std::exponential_distribution<double>(1.0 / std::max(mean, 1e-9))(g);
+        if (type == "lognormal")
+        {
+            double s2 = std::log(1 + cv * cv);
+            return std::lognormal_distribution<double>(std::log(std::max(mean, 1e-9)) - s2 / 2, std::sqrt(s2))(g);
+        }
+        if (type == "gamma")
+        {
+            double k = 1.0 / std::max(cv * cv, 1e-9);
+            return std::gamma_distribution<double>(k, mean / k)(g);
+        }
+        if (type == "normal")
+            return std::normal_distribution<double>(mean, mean * cv)(g);
+        throw std::invalid_argument("unknown service distribution: " + type);
+    }
+    template <class RNG>
+    int draw(RNG &g) const
+    {
+        double x = std::round(draw_raw(g));
+        return int(std::clamp(x, min, max));
+    }
+    // empirical quantile table from a fixed-seed sample, so every distribution
+    // gets quantiles without special functions
+    void build_quantiles()
+    {
+        std::mt19937_64 g(424242);
+        std::vector<int> xs(20000);
+        for (auto &x : xs)
+            x = draw(g);
+        std::sort(xs.begin(), xs.end());
+        qtable.resize(1001);
+        for (int i = 0; i <= 1000; i++)
+            qtable[i] = xs[std::min<size_t>(xs.size() - 1, size_t(i / 1000.0 * (xs.size() - 1)))];
+    }
+    int quantile(double q) const
+    {
+        if (qtable.empty())
+            return 0;
+        return qtable[std::clamp(int(std::lround(q * 1000)), 0, 1000)];
+    }
+    double expected() const
+    {
+        double m = 0;
+        for (int i = 0; i <= 1000; i++)
+            m += qtable[i];
+        return qtable.empty() ? 0 : m / qtable.size();
+    }
+};
 
 struct LorrExtConfig
 {
@@ -51,11 +125,12 @@ struct LorrExtConfig
     uint64_t arrivalSeed = 0;
 
     // ---- service times -------------------------------------------------
-    // Stop j of every task needs the robot to be on the errand cell for
-    // d ~ U{lo_j, hi_j} ticks (cumulative; being pushed off pauses the clock),
-    // with [lo_j, hi_j] = serviceIntervals[j % size]. Empty => instantaneous.
-    std::vector<std::pair<int, int>> serviceIntervals;
+    // Errand j of every task needs the robot to be on the errand cell for d
+    // ticks (cumulative; being pushed off pauses the clock), with
+    // d ~ service[j % size]. Empty => instantaneous (the original kit).
+    std::vector<ServiceDist> service;
     uint64_t serviceSeed = 0;
+    double serviceQuantile = 0.95;   // the "safe" duration baselines plan with
 
     // ---- metrics / baselines --------------------------------------------
     int deadline = 300;              // informational; analysis can re-threshold
@@ -114,10 +189,31 @@ struct LorrExt
         if (j.contains("service"))
         {
             const auto &s = j["service"];
+            // "intervals": [[lo, hi], ...]  (shorthand for uniform)
             if (s.contains("intervals"))
                 for (const auto &iv : s["intervals"])
-                    c.serviceIntervals.emplace_back(iv[0].get<int>(), iv[1].get<int>());
+                {
+                    ServiceDist d;
+                    d.lo = iv[0].get<int>(); d.hi = iv[1].get<int>();
+                    d.min = d.lo; d.max = d.hi;
+                    c.service.push_back(d);
+                }
+            // "stops": [{"dist": "lognormal", "mean": 20, "cv": 0.5, "min": 1, "max": 200}, ...]
+            if (s.contains("stops"))
+                for (const auto &o : s["stops"])
+                {
+                    ServiceDist d;
+                    d.type = get(o, "dist", std::string("fixed"));
+                    d.lo = get(o, "lo", 0.0); d.hi = get(o, "hi", 0.0);
+                    d.mean = get(o, "mean", 0.0); d.cv = get(o, "cv", 0.0);
+                    d.min = get(o, "min", d.type == "uniform" ? d.lo : 0.0);
+                    d.max = get(o, "max", d.type == "uniform" ? d.hi : 1e9);
+                    c.service.push_back(d);
+                }
+            for (auto &d : c.service)
+                d.build_quantiles();
             c.serviceSeed = get(s, "seed", c.serviceSeed);
+            c.serviceQuantile = get(s, "planQuantile", c.serviceQuantile);
         }
         c.deadline = get(j, "deadline", c.deadline);
         c.scheduler = get(j, "scheduler", c.scheduler);
@@ -126,25 +222,41 @@ struct LorrExt
 
     static bool custom_arrivals() { return cfg().enabled && cfg().arrival != "pool"; }
 
-    // Known service interval of stop `stop_idx` (what a scheduler may use).
+    // ---- what a scheduler may know: the distribution, not the draw ----
+    static const ServiceDist *service_dist(int stop_idx)
+    {
+        const auto &sv = cfg().service;
+        if (!cfg().enabled || sv.empty())
+            return nullptr;
+        return &sv[stop_idx % sv.size()];
+    }
+    static double service_mean(int stop_idx)
+    {
+        auto *d = service_dist(stop_idx);
+        return d ? d->expected() : 0.0;
+    }
+    static int service_quantile(int stop_idx, double q)
+    {
+        auto *d = service_dist(stop_idx);
+        return d ? d->quantile(q) : 0;
+    }
+    // kept for the interval setting: (lo, hi) = (q0, q1)
     static std::pair<int, int> service_interval(int stop_idx)
     {
-        const auto &iv = cfg().serviceIntervals;
-        if (!cfg().enabled || iv.empty())
-            return {0, 0};
-        return iv[stop_idx % iv.size()];
+        return {service_quantile(stop_idx, 0.0), service_quantile(stop_idx, 1.0)};
     }
 
-    // Hidden realised service time; a hash of (seed, task, stop) so it is the
-    // same for every solver regardless of call order.
+    // Hidden realised service time: drawn from a generator seeded by a hash of
+    // (seed, task, stop), so it is the same for every solver and call order.
     static int service_time(int task_id, int stop_idx)
     {
-        auto iv = service_interval(stop_idx);
-        if (iv.second <= 0)
+        auto *d = service_dist(stop_idx);
+        if (!d)
             return 0;
         uint64_t x = cfg().serviceSeed * 0x9E3779B97F4A7C15ULL ^ (uint64_t(task_id) << 20) ^ uint64_t(stop_idx);
         x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL; x ^= x >> 33;
-        return iv.first + int(x % uint64_t(iv.second - iv.first + 1));
+        std::mt19937_64 g(x);
+        return d->draw(g);
     }
 
     // Number of arrivals in tick t (advances the process by one tick).
@@ -224,7 +336,7 @@ struct LorrExt
             st().last_seen.erase(k);
             return false;
         }
-        if (!cfg().enabled || cfg().serviceIntervals.empty())
+        if (!cfg().enabled || cfg().service.empty())
             return true;
         int t = tm.curr_timestep;
         auto &s = st();
@@ -258,10 +370,12 @@ struct LorrExt
         ext["deadline"] = c.deadline;
         ext["scheduler"] = c.scheduler;
         ext["simulationTime"] = simulation_time;
-        nlohmann::ordered_json iv = nlohmann::ordered_json::array();
-        for (auto &p : c.serviceIntervals)
-            iv.push_back({p.first, p.second});
-        ext["serviceIntervals"] = iv;
+        nlohmann::ordered_json sv = nlohmann::ordered_json::array();
+        for (auto &d : c.service)
+            sv.push_back({{"dist", d.type}, {"lo", d.lo}, {"hi", d.hi}, {"mean", d.mean}, {"cv", d.cv},
+                          {"min", d.min}, {"max", std::min(d.max, 1e6)},
+                          {"q05", d.quantile(0.05)}, {"q50", d.quantile(0.5)}, {"q95", d.quantile(0.95)}});
+        ext["service"] = sv;
         // [task_id, t_revealed, t_completed (-1 = open), agent, n_stops]
         nlohmann::ordered_json recs = nlohmann::ordered_json::array();
         for (auto *t : tm.all_tasks)

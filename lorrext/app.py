@@ -21,7 +21,7 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lorrext import analyze, arrivals  # noqa: E402
-from lorrext.core import ROOT, SOLVERS, Setting  # noqa: E402
+from lorrext.core import ROOT, SERVICE_PRESETS, SOLVERS, Setting, service_stops  # noqa: E402
 
 RUNS = ROOT / "runs"
 st.set_page_config(page_title="LoRR-Ext workbench", layout="wide")
@@ -129,8 +129,8 @@ with tab_new:
     left, right = st.columns([1, 1])
     with left:
         name = st.text_input("sweep name", "my_sweep")
-        arrival = st.selectbox("arrival model", ["poisson", "mmpp", "hawkes", "pool"],
-                               help="pool = the competition's always-full task pool")
+        arrival = st.selectbox("arrival model", ["pool", "poisson", "mmpp", "hawkes"],
+                               help="pool = the competition's always-full task pool (numTasksReveal x robots open at all times)")
         s0 = Setting(arrival=arrival)
         if arrival == "mmpp":
             s0.burst_factor = st.slider("burst rate / mean rate", 1.0, 10.0, 4.0, 0.5)
@@ -141,8 +141,16 @@ with tab_new:
             s0.decay = st.slider("excitation decay per tick", 0.005, 0.5, 0.05, 0.005)
         rates = st.multiselect("arrival rates (tasks/tick)", [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0, 1.2],
                                default=[0.1, 0.3, 0.5]) if arrival != "pool" else [0.0]
-        service = st.text_input("service intervals per errand (`none`, `kitchen`, or `lo-hi;lo-hi`)", "none",
-                                help="errand j of a task needs the robot on the cell for U{lo,hi} ticks, interval j mod n")
+        preset = st.selectbox("service time per errand", list(SERVICE_PRESETS) + ["custom"],
+                              help="how long a robot must stay on an errand cell; errand j of a task uses slot j mod n")
+        service = st.text_input("custom spec: `lo-hi` or `dist:mean[:cv[:min[:max]]]`, slots separated by `;` "
+                                "(dist = uniform, fixed, exponential, lognormal, gamma, normal)",
+                                "lognormal:3:0.3;gamma:20:0.5") if preset == "custom" else preset
+        try:
+            stops = service_stops(service)
+        except Exception as e:  # noqa: BLE001
+            st.error(f"bad service spec: {e}")
+            stops = []
         p_delay = st.slider("move-delay probability (2026 kit only)", 0.0, 0.2, 0.0, 0.01)
         seeds = st.number_input("seeds", 1, 10, 1)
         steps = st.number_input("ticks per run", 200, 5000, 1000, 100)
@@ -161,6 +169,15 @@ with tab_new:
         est = sum((steps * 0.035 + 8) if SOLVERS[c]["gen"] == "2026" else (steps * 0.07 + 10) for c in chosen) * len(rates) * seeds
         st.metric("runs", n)
         st.metric("estimated time with 5 workers", f"{est / 5 / 60:.0f} min")
+        if stops:
+            fig, ax = plt.subplots(figsize=(6, 2.2))
+            for j, stop in enumerate(stops):
+                x = arrivals.service_samples(stop)
+                ax.hist(x, bins=np.arange(x.min(), x.max() + 2) - 0.5, alpha=0.6, density=True,
+                        label=f"slot {j}: {stop['dist']} (mean {x.mean():.1f}, p95 {np.percentile(x, 95):.0f})")
+            ax.set_xlabel("service time (ticks)"); ax.set_ylabel("probability"); ax.legend(fontsize=7)
+            ax.set_title("service-time distributions (what the robot must wait at each errand)", fontsize=9)
+            st.pyplot(fig, width="stretch")
         if arrival != "pool":
             s_prev = Setting(**{**asdict(s0), "rate": max(rates) if rates else 0.3, "steps": steps})
             x = arrivals.sample(s_prev, steps)

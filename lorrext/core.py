@@ -36,9 +36,9 @@ PLAN_MS = 100     # 2024 kit: planner time per tick
 
 @dataclass
 class Setting:
-    arrival: str = "poisson"        # pool | poisson | mmpp | hawkes
+    arrival: str = "pool"           # pool (competition default) | poisson | mmpp | hawkes
     rate: float = 0.5               # mean tasks per tick (ignored for pool)
-    service: str = "none"           # none | kitchen | custom "lo-hi;lo-hi;..."
+    service: str = "none"           # none | preset | spec, see service_config()
     p_delay: float = 0.0            # 2026 move-delay probability per action
     seed: int = 0
     deadline: int = 300
@@ -51,7 +51,7 @@ class Setting:
     decay: float = 0.05             # hawkes: kernel decay per tick
 
     def key(self) -> str:
-        svc = self.service.replace(";", "+")
+        svc = self.service.replace(";", "+").replace(":", "_")
         s = f"{self.arrival}_r{self.rate:g}_{svc}_d{self.p_delay:g}_s{self.seed}_T{self.steps}"
         if self.arrival == "pool":
             s = f"pool{self.pool_reveal:g}_{svc}_d{self.p_delay:g}_s{self.seed}_T{self.steps}"
@@ -65,14 +65,45 @@ class Setting:
         return s
 
 
-SERVICE = {"none": [], "kitchen": [[2, 4], [10, 30]]}  # pickup, then cook/deliver
+# Service-time presets. Errand j of a task uses entry j % n.
+SERVICE_PRESETS = {
+    "none": "",
+    "kitchen": "2-4;10-30",                                  # intervals: pickup, then cook/hand over
+    "kitchen_dist": "lognormal:3:0.3;lognormal:20:0.5",       # same means, as distributions
+    "kitchen_exp": "exponential:3;exponential:20",            # memoryless, heavy right tail
+}
+DISTS = ("uniform", "fixed", "exponential", "lognormal", "gamma", "normal")
+
+
+def service_stops(spec: str) -> list[dict]:
+    """Parse a service spec into one dict per errand slot.
+
+    'lo-hi'                          -> uniform integer interval
+    'dist:mean[:cv[:min[:max]]]'     -> distribution with that mean and
+                                        coefficient of variation (sd / mean)
+    Parts are separated by ';'. Presets: see SERVICE_PRESETS.
+    """
+    spec = SERVICE_PRESETS.get(spec, spec)
+    stops = []
+    for part in filter(None, spec.split(";")):
+        if ":" not in part:
+            lo, hi = (int(x) for x in part.split("-"))
+            stops.append({"dist": "uniform", "lo": lo, "hi": hi})
+            continue
+        name, *nums = part.split(":")
+        if name not in DISTS:
+            raise ValueError(f"unknown distribution {name!r}; choose from {DISTS}")
+        keys = ["mean", "cv", "min", "max"]
+        d = {"dist": name, **{k: float(v) for k, v in zip(keys, nums)}}
+        if name == "exponential":
+            d["cv"] = 1.0
+        stops.append(d)
+    return stops
 
 
 def service_intervals(spec: str) -> list[list[int]]:
-    """'none' | 'kitchen' | 'lo-hi;lo-hi' -> [[lo, hi], ...] (stop j uses entry j % n)."""
-    if spec in SERVICE:
-        return SERVICE[spec]
-    return [[int(x) for x in part.split("-")] for part in spec.split(";") if part]
+    """Back-compat helper: [[lo, hi], ...] for interval-only specs."""
+    return [[d["lo"], d["hi"]] for d in service_stops(spec) if d["dist"] == "uniform"]
 
 
 def arrival_config(s: Setting) -> dict:
@@ -106,7 +137,7 @@ def write_instance(s: Setting, scheduler: str, out_dir: Path) -> Path:
                         "pDelay": s.p_delay, "durationModel": "uniform",
                         "gaussMeanRatio": 0.5, "gaussStdRatio": 0.22},
         "lorrExt": {"arrival": arrival,
-                    "service": {"intervals": service_intervals(s.service), "seed": s.seed},
+                    "service": {"stops": service_stops(s.service), "seed": s.seed},
                     "deadline": s.deadline, "scheduler": scheduler},
     }
     p = out_dir / f"{s.key()}_{scheduler}.json"
@@ -160,6 +191,58 @@ def run(solver: str, s: Setting, out_dir: Path, screen: int = 3, timeout: int = 
     return row
 
 
+# ----------------------------------------------------------------- task geometry
+_GEOM: dict = {}
+
+
+def _geometry():
+    """Map free cells, BFS distance cache and task errand lists (from the base instance)."""
+    if not _GEOM:
+        lines = (BASE / "maps" / "random-32-32-20.map").read_text().splitlines()
+        h, w = int(lines[1].split()[1]), int(lines[2].split()[1])
+        free = [[ch in ".GSE" for ch in row[:w]] for row in lines[4:4 + h]]
+        tlines = (BASE / "tasks" / "random_32_32_20_official.tasks").read_text().splitlines()[2:]
+        _GEOM.update(h=h, w=w, free=free, dist={}, tasks=[[int(x) for x in l.split(",")] for l in tlines if l.strip()])
+    return _GEOM
+
+
+def bfs_from(src: int) -> dict:
+    """Shortest number of moves (ignoring rotations) from cell src to every cell."""
+    g = _geometry()
+    if src in g["dist"]:
+        return g["dist"][src]
+    h, w, free = g["h"], g["w"], g["free"]
+    d = {src: 0}
+    frontier = [src]
+    while frontier:
+        nxt = []
+        for c in frontier:
+            r, k = divmod(c, w)
+            for rr, kk in ((r + 1, k), (r - 1, k), (r, k + 1), (r, k - 1)):
+                if 0 <= rr < h and 0 <= kk < w and free[rr][kk]:
+                    n = rr * w + kk
+                    if n not in d:
+                        d[n] = d[c] + 1
+                        nxt.append(n)
+        frontier = nxt
+    g["dist"][src] = d
+    return d
+
+
+def task_length(task_id: int) -> int:
+    """Intrinsic travel of a task: moves from its first errand through the rest."""
+    locs = _geometry()["tasks"][task_id % len(_geometry()["tasks"])]
+    return sum(bfs_from(a).get(b, 0) for a, b in zip(locs, locs[1:]))
+
+
+def expected_service(js: dict, n_stops: int) -> float:
+    sv = js["lorrExt"].get("service", [])
+    if not sv:
+        return 0.0
+    means = [(d["lo"] + d["hi"]) / 2 if d["dist"] == "uniform" else d["mean"] for d in sv]
+    return sum(means[j % len(means)] for j in range(n_stops))
+
+
 # ----------------------------------------------------------------- metrics
 def task_table(js: dict) -> np.ndarray:
     """(n, 3) array: t_revealed, t_completed (-1 open), n_stops."""
@@ -201,6 +284,15 @@ def metrics(js: dict, deadline: int) -> dict:
     eligible = tt[(tt[:, 0] >= 0.1 * T) & (tt[:, 0] <= T - deadline)]
     miss = np.where(eligible[:, 1] >= 0, eligible[:, 1] - eligible[:, 0] > deadline, True)
     q = lambda p: float(np.percentile(lat, p)) if len(lat) else float("nan")
+    # CVaR_95: mean latency of the worst 5% of tasks (open tasks at their age so far)
+    worst = np.sort(lat)[-max(1, int(np.ceil(0.05 * len(lat)))):] if len(lat) else np.array([np.nan])
+    # normalised latency: latency / (own errand-to-errand travel + expected service)
+    recs = [r for r in js["lorrExt"]["tasks"] if r[1] >= 0.1 * T]
+    ideal = np.array([max(1.0, task_length(r[0]) + expected_service(js, r[4])) for r in recs])
+    stretch = lat / ideal if len(lat) == len(ideal) and len(lat) else np.array([np.nan])
+    # time-averaged number of open tasks over the scored window
+    ts = np.arange(int(0.1 * T), T)
+    open_t = ((tt[:, 0][None, :] <= ts[:, None]) & ((tt[:, 1][None, :] < 0) | (tt[:, 1][None, :] > ts[:, None]))).sum(1) if len(tt) else np.zeros(1)
     return {
         "finished": int(js["numTaskFinished"]),
         "throughput": js["numTaskFinished"] / T,
@@ -208,6 +300,9 @@ def metrics(js: dict, deadline: int) -> dict:
         "open_at_end": int((tt[:, 1] < 0).sum()),
         "lat_mean": float(lat.mean()) if len(lat) else float("nan"),
         "lat_p50": q(50), "lat_p90": q(90), "lat_p99": q(99), "lat_max": float(lat.max()) if len(lat) else float("nan"),
+        "lat_cvar95": float(worst.mean()),
+        "stretch_p50": float(np.median(stretch)), "stretch_p99": float(np.percentile(stretch, 99)),
+        "open_mean": float(open_t.mean()),
         "censored_frac": float(open_.mean()) if len(lat) else float("nan"),
         "miss_rate": float(miss.mean()) if len(miss) else float("nan"),
         **deadline_metrics(tt, T),
