@@ -11,9 +11,13 @@ from pathlib import Path
 
 import numpy as np
 
+from . import cellmaps
+
 ROOT = Path(__file__).resolve().parent.parent
 KITS = ROOT / "kits"
 BASE = ROOT / "instances" / "base"
+MAP_FILE = BASE / "maps" / "random-32-32-20.map"
+FREE = cellmaps.read_free(MAP_FILE) if MAP_FILE.exists() else np.ones((32, 32), bool)
 
 # ----------------------------------------------------------------- solvers
 # gen "2026": real-time kit (ticks of TICK_MS, planner window WINDOW_MS)
@@ -22,8 +26,6 @@ SOLVERS = {
     "default2026": dict(kit="lorr2026", gen="2026", scheduler="default", label="2026 default (greedy)"),
     "fifo2026": dict(kit="lorr2026", gen="2026", scheduler="fifo", label="oldest-first"),
     "slack2026": dict(kit="lorr2026", gen="2026", scheduler="slack", label="least-slack"),
-    "stage2026": dict(kit="lorr2026", gen="2026", scheduler="stage", label="staging (on errand)"),
-    "stagenear2026": dict(kit="lorr2026", gen="2026", scheduler="stage_near", label="staging (next to errand)"),
     "default2024": dict(kit="default2024", gen="2024", scheduler="default", label="2024 default"),
     "nms2024": dict(kit="nms2024", gen="2024", scheduler="default", label="No Man's Sky (2024 1st)"),
     "kitty2024": dict(kit="kitty2024", gen="2024", scheduler="default", label="Kitty_Knight (2024 2nd, guarded)"),
@@ -38,8 +40,9 @@ PLAN_MS = 100     # 2024 kit: planner time per tick
 class Setting:
     arrival: str = "pool"           # pool (competition default) | poisson | mmpp | hawkes
     rate: float = 0.5               # mean tasks per tick (ignored for pool)
-    service: str = "none"           # none | preset | spec, see service_config()
-    p_delay: float = 0.0            # 2026 move-delay probability per action
+    service: str = "none"           # per-cell service-time map, see lorrext/cellmaps.py
+    delay: str = "none"             # per-cell move-delay map (2026 kit only); none = deterministic
+    p_delay: float = 0.0            # the 2026 kit's own location-blind delays (kept at 0)
     seed: int = 0
     deadline: int = 300
     steps: int = 1000
@@ -51,10 +54,12 @@ class Setting:
     decay: float = 0.05             # hawkes: kernel decay per tick
 
     def key(self) -> str:
-        svc = self.service.replace(";", "+").replace(":", "_")
+        svc = Path(self.service).stem if self.service.endswith(".json") else self.service.replace(":", "_")
         s = f"{self.arrival}_r{self.rate:g}_{svc}_d{self.p_delay:g}_s{self.seed}_T{self.steps}"
         if self.arrival == "pool":
             s = f"pool{self.pool_reveal:g}_{svc}_d{self.p_delay:g}_s{self.seed}_T{self.steps}"
+        if self.delay != "none":
+            s += "_delay-" + (Path(self.delay).stem if self.delay.endswith(".json") else self.delay.replace(":", "_"))
         d = Setting()
         extra = {"mmpp": ("burst_factor", "burst_fraction", "burst_length"), "hawkes": ("branching", "decay")}
         for f in extra.get(self.arrival, ()):
@@ -63,47 +68,6 @@ class Setting:
         if self.deadline != d.deadline:
             s += f"_D{self.deadline}"
         return s
-
-
-# Service-time presets. Errand j of a task uses entry j % n.
-SERVICE_PRESETS = {
-    "none": "",
-    "kitchen": "2-4;10-30",                                  # intervals: pickup, then cook/hand over
-    "kitchen_dist": "lognormal:3:0.3;lognormal:20:0.5",       # same means, as distributions
-    "kitchen_exp": "exponential:3;exponential:20",            # memoryless, heavy right tail
-}
-DISTS = ("uniform", "fixed", "exponential", "lognormal", "gamma", "normal")
-
-
-def service_stops(spec: str) -> list[dict]:
-    """Parse a service spec into one dict per errand slot.
-
-    'lo-hi'                          -> uniform integer interval
-    'dist:mean[:cv[:min[:max]]]'     -> distribution with that mean and
-                                        coefficient of variation (sd / mean)
-    Parts are separated by ';'. Presets: see SERVICE_PRESETS.
-    """
-    spec = SERVICE_PRESETS.get(spec, spec)
-    stops = []
-    for part in filter(None, spec.split(";")):
-        if ":" not in part:
-            lo, hi = (int(x) for x in part.split("-"))
-            stops.append({"dist": "uniform", "lo": lo, "hi": hi})
-            continue
-        name, *nums = part.split(":")
-        if name not in DISTS:
-            raise ValueError(f"unknown distribution {name!r}; choose from {DISTS}")
-        keys = ["mean", "cv", "min", "max"]
-        d = {"dist": name, **{k: float(v) for k, v in zip(keys, nums)}}
-        if name == "exponential":
-            d["cv"] = 1.0
-        stops.append(d)
-    return stops
-
-
-def service_intervals(spec: str) -> list[list[int]]:
-    """Back-compat helper: [[lo, hi], ...] for interval-only specs."""
-    return [[d["lo"], d["hi"]] for d in service_stops(spec) if d["dist"] == "uniform"]
 
 
 def arrival_config(s: Setting) -> dict:
@@ -137,7 +101,9 @@ def write_instance(s: Setting, scheduler: str, out_dir: Path) -> Path:
                         "pDelay": s.p_delay, "durationModel": "uniform",
                         "gaussMeanRatio": 0.5, "gaussStdRatio": 0.22},
         "lorrExt": {"arrival": arrival,
-                    "service": {"stops": service_stops(s.service), "seed": s.seed},
+                    "mapCols": FREE.shape[1],
+                    "service": {**(cellmaps.build(s.service, "service", FREE, s.seed) or {}), "seed": s.seed},
+                    "delay": {**(cellmaps.build(s.delay, "delay", FREE, s.seed) or {}), "seed": s.seed},
                     "deadline": s.deadline, "scheduler": scheduler},
     }
     p = out_dir / f"{s.key()}_{scheduler}.json"
@@ -148,6 +114,8 @@ def write_instance(s: Setting, scheduler: str, out_dir: Path) -> Path:
 def run(solver: str, s: Setting, out_dir: Path, screen: int = 3, timeout: int = 1800, cpus: str | None = None) -> dict:
     """Run one simulation; returns the metrics row (also cached as JSON)."""
     sv = SOLVERS[solver]
+    if sv["gen"] == "2024" and (s.delay != "none" or s.p_delay > 0):
+        raise ValueError(f"{solver}: the 2024 kit has no move-delay model; use a 2026-kit solver for delays")
     out_dir = Path(out_dir).resolve()
     tag = f"{solver}__{s.key()}"
     row_path = out_dir / "rows" / f"{tag}.json"
@@ -178,7 +146,7 @@ def run(solver: str, s: Setting, out_dir: Path, screen: int = 3, timeout: int = 
     row = {"solver": solver, **asdict(s), "cpus": cpus, "returncode": rc, "wall_s": round(time.time() - t0, 1), "output": str(out)}
     if out.exists():
         js = json.loads(out.read_text())
-        row.update(metrics(js, s.deadline))
+        row.update(metrics(js, s.deadline, cellmaps.per_cell(cellmaps.build(s.service, "service", FREE, s.seed), FREE)))
         # per-task records (id, reveal, done, agent, stops) for task-level diffs
         (out_dir / "tasks").mkdir(exist_ok=True)
         np.save(out_dir / "tasks" / f"{tag}.npy", np.array(js["lorrExt"]["tasks"], dtype=np.int32).reshape(-1, 5))
@@ -235,12 +203,13 @@ def task_length(task_id: int) -> int:
     return sum(bfs_from(a).get(b, 0) for a, b in zip(locs, locs[1:]))
 
 
-def expected_service(js: dict, n_stops: int) -> float:
-    sv = js["lorrExt"].get("service", [])
-    if not sv:
+def expected_service(task_id: int, svc_grid: np.ndarray | None) -> float:
+    """Expected total service time of a task from the per-cell mean grid."""
+    if svc_grid is None:
         return 0.0
-    means = [(d["lo"] + d["hi"]) / 2 if d["dist"] == "uniform" else d["mean"] for d in sv]
-    return sum(means[j % len(means)] for j in range(n_stops))
+    w = svc_grid.shape[1]
+    locs = _geometry()["tasks"][task_id % len(_geometry()["tasks"])]
+    return float(sum(np.nan_to_num(svc_grid[v // w, v % w]) for v in locs))
 
 
 # ----------------------------------------------------------------- metrics
@@ -276,7 +245,7 @@ def deadline_metrics(tt: np.ndarray, T: int) -> dict:
     return out
 
 
-def metrics(js: dict, deadline: int) -> dict:
+def metrics(js: dict, deadline: int, svc_grid: np.ndarray | None = None) -> dict:
     T = js["lorrExt"]["simulationTime"]
     lat, open_ = latencies(js)
     tt = task_table(js)
@@ -288,7 +257,7 @@ def metrics(js: dict, deadline: int) -> dict:
     worst = np.sort(lat)[-max(1, int(np.ceil(0.05 * len(lat)))):] if len(lat) else np.array([np.nan])
     # normalised latency: latency / (own errand-to-errand travel + expected service)
     recs = [r for r in js["lorrExt"]["tasks"] if r[1] >= 0.1 * T]
-    ideal = np.array([max(1.0, task_length(r[0]) + expected_service(js, r[4])) for r in recs])
+    ideal = np.array([max(1.0, task_length(r[0]) + expected_service(r[0], svc_grid)) for r in recs])
     stretch = lat / ideal if len(lat) == len(ideal) and len(lat) else np.array([np.nan])
     # time-averaged number of open tasks over the scored window
     ts = np.arange(int(0.1 * T), T)

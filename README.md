@@ -3,7 +3,8 @@
 LoRR-Ext is a testbed that asks **how much of a solver's leaderboard throughput is actually usable once tasks must finish within a deadline**. It extends the [League of Robot Runners](https://www.leagueofrobotrunners.org/) (LoRR) Start-Kit with three things the competition doesn't model:
 
 1. **Known arrival processes (optional).** The default is the competition's always-full task pool. For benchmarking, tasks can instead arrive from a known Poisson, bursty two-state (Markov-modulated Poisson, MMPP) or self-exciting (Hawkes) process.
-2. **Uncertain service times.** Each errand needs the robot to stay on the cell for a hidden duration drawn from a *known* distribution: a uniform interval (`2-4`), or `lognormal`, `gamma`, `exponential`, `normal` or `fixed` with a given mean and coefficient of variation (e.g. `lognormal:20:0.5`). The "kitchen" presets are `kitchen` (2–4 ticks to pick up, 10–30 to cook or hand over) and `kitchen_dist` (the same means as lognormal distributions).
+2. **Uncertain service times, tied to cells.** Work is tied to a place (cutting onions at cell (10, 12)), so each cell has a *known* service-time distribution, as you'd estimate from past data: a uniform interval, or `lognormal`, `gamma`, `exponential`, `normal` or `fixed` with a given mean and coefficient of variation. A robot must stay on its errand cell for a hidden duration drawn from that cell's distribution. Presets: `kitchen` (four work zones) and `stations` (10% of cells are stations); or `all:<dist>`, or your own JSON map.
+2b. **Per-cell move delays (2026 kit, off by default).** Each cell has a chance per tick that a robot on it gets stuck, and a distribution for how long. Presets: `kit_like` (the kit's own location-blind model) and `congestion` (narrow passages are risky).
 3. **Latency and deadline metrics.** Each task's latency is recorded, along with deadline-miss rates and 99th-percentile latency (tasks still open count as misses), and from these a single gap metric.
 
 The same patch applies to the 2026 Start-Kit (v3.1.0) and to archived 2024-season entries. When the new settings are absent, every kit behaves exactly as released.
@@ -31,7 +32,7 @@ Requirements: Linux, CMake, a C++17 compiler, Boost (program_options, system, fi
 | Path | What it is |
 |---|---|
 | `ext/lorr_ext.h` | The extension: arrival processes, service-time dwell, per-task records. Header-only, wired in through four hooks. |
-| `ext/ext_scheduler.cpp` | Baseline task schedulers for the 2026 kit (oldest-first, least-slack, two staging variants). |
+| `ext/ext_scheduler.cpp` | Baseline task schedulers for the 2026 kit (oldest-first, least-slack). |
 | `tools/patch_kit.py` | Applies the hooks to any kit tree. Whitespace-tolerant, idempotent, and it fails loudly on a missing anchor. Also holds the opt-in Kitty_Knight guards. |
 | `scripts/setup.sh` | Fetches pinned sources and builds patched copies into `kits/`. |
 | `lorrext/core.py` | Solver registry, instance writer, single-run driver, metrics. |
@@ -50,16 +51,22 @@ Turned on by a `lorrExt` object in the instance JSON:
 "lorrExt": {
   "arrival":  {"model": "mmpp", "rate": 0.3, "seed": 0,
                "burstFactor": 4.0, "burstFraction": 0.2, "burstLength": 50},
-  "service":  {"stops": [{"dist": "uniform", "lo": 2, "hi": 4},
-                         {"dist": "lognormal", "mean": 20, "cv": 0.5, "min": 1, "max": 200}],
+  "mapCols": 32,
+  "service":  {"default": null,
+               "cells": [{"name": "cut onions", "cells": [[10, 12], [10, 13]],
+                          "dist": "lognormal", "mean": 12, "cv": 0.4}],
                "seed": 0, "planQuantile": 0.95},
+  "delay":    {"default": {"p": 0.002, "dist": "uniform", "lo": 1, "hi": 2},
+               "cells": [{"cells": [[5, 7]], "p": 0.05, "dist": "lognormal", "mean": 4, "cv": 0.6}],
+               "seed": 0},
   "deadline": 300,
   "scheduler": "fifo"
 }
 ```
 
 * **Arrivals.** The model is one of `pool` (the original kit), `poisson`, `mmpp` or `hawkes`. All models have the same long-run mean `rate`. Arrivals come from a dedicated random stream, so every solver sees identical task arrivals for a given seed (this is tested). Task contents still come from the task file, in order.
-* **Service.** Errand *j* of a task uses `stops[j mod n]` (`intervals: [[lo, hi], ...]` is accepted as shorthand). The realised duration is drawn from a generator seeded by (seed, task, errand), so it doesn't depend on solver behaviour. A robot must accumulate that many ticks on the cell. Being pushed off pauses the clock, and the clock restarts if a different robot takes the errand over. Schedulers can read the known distribution through `LorrExt::service_mean()` and `LorrExt::service_quantile()`; the realised value stays hidden.
+* **Service.** An errand at cell *v* uses *v*'s distribution (or `default`; `null` = no work). The realised duration is drawn from a generator seeded by (seed, task, errand), so it doesn't depend on solver behaviour. A robot must accumulate that many ticks on the cell. Being pushed off pauses the clock, and the clock restarts if a different robot takes the errand over. Schedulers can read the known distribution through `LorrExt::service_mean_at(v)` and `LorrExt::service_quantile_at(v, q)`; the realised value stays hidden. Maps are built by `lorrext/cellmaps.py`.
+* **Delays (2026 kit).** Each tick, a robot on cell *v* that isn't already delayed gets stuck with probability `p` of *v*'s group (or `default`), for a length drawn from that group's distribution. With no `delay` block, travel is deterministic. Delay events are written to `lorrExt.delayEvents`.
 * **Records.** The output JSON gets `lorrExt.tasks = [[id, revealed, completed (-1 = open), agent, n_errands], ...]`.
 * **Metrics** (see the explainer, §4): throughput; latency mean/p50/p99/max; CVaR95; deadline-miss rate and p99 at several deadlines; normalised latency (stretch); mean open tasks; and, across a sweep, deadline-feasible capacity and the SLA gap.
 
@@ -71,7 +78,8 @@ Turned on by a `lorrExt` object in the instance JSON:
 | `TaskManager.cpp` | the reveal loop becomes `if (!LorrExt::reveal(...)) while (...)`; the "robot is on its next errand" test becomes `LorrExt::stop_reached(...)` |
 | `driver.cpp` | `LorrExt::configure(data, team_size)` after `set_num_tasks_reveal` |
 | `CompetitionSystem.cpp` | `LorrExt::save(...)` in `saveResults` |
-| `TaskScheduler.cpp`, `Entry.cpp` (2026 only) | dispatch to the baseline schedulers; parking goals for idle robots |
+| `TaskScheduler.cpp` (2026 only) | dispatch to the baseline schedulers |
+| `Simulator.cpp` (2026 only) | `LorrExt::simulate_delay(...)` replaces the kit's delay draw when a delay map is set |
 
 ## Benchmark setup
 
@@ -83,8 +91,6 @@ Turned on by a `lorrExt` object in the instance JSON:
 | `default2026` | 2026 default entry (greedy: each free robot takes its shortest task) | 2026 |
 | `fifo2026` | oldest task first, to the nearest free robot | 2026 |
 | `slack2026` | least slack first, using the known worst-case service time | 2026 |
-| `stage2026` | oldest-first, plus idle robots parked *on* recent pickup cells | 2026 |
-| `stagenear2026` | same, parked *next to* recent pickup cells | 2026 |
 | `default2024` | 2024 default entry (archived) | 2024 |
 | `nms2024` | No Man's Sky, 2024 1st place, Combined track (commit 44950d1) | 2024 |
 | `kitty2024` | Kitty_Knight, 2024 2nd place (commit da7d428), **guarded** (see below) | 2024 |
@@ -114,6 +120,8 @@ Turned on by a `lorrExt` object in the instance JSON:
 
 ## Results
 
+> These results come from the first benchmark build: per-errand service intervals (`kitchen` = 2–4 then 10–30 ticks, alternating by errand), the kit's own uniform delays, 1–3 seeds per point, and two since-removed staging baselines (now dropped from the tables). Service and delays are now per cell, so rerun the grid before quoting numbers.
+
 The full tables are in [`results/summary.md`](results/summary.md) (deadlines 200, 300 and 400 ticks) and the per-run data is in `results/runs.csv`.
 
 ### Capacity and SLA gap at a 300-tick deadline
@@ -126,8 +134,6 @@ The full tables are in [`results/summary.md`](results/summary.md) (deadlines 200
 | 2026 default (greedy) | 2026 | 0.44 | 0 | 0.05 | 0 | 0 | 1.00 | 0.89 | 1.00 |
 | oldest-first | 2026 | 0.40 | 0.05 | 0.2 | 0 | 0 | 0.88 | 0.50 | 1.00 |
 | least-slack | 2026 | 0.40 | 0 | 0.1 | 0 | 0 | 1.00 | 0.75 | 1.00 |
-| staging, on errand | 2026 | 0.40 | 0 | 0 | 0 | 0 | 1.00 | 1.00 | 1.00 |
-| staging, next to errand | 2026 | 0.41 | 0 | 0 | 0 | 0 | 1.00 | 1.00 | 1.00 |
 
 Capacity and throughput are in tasks/tick. \* = feasible at that rate but infeasible at every lower rate tested (a low-load failure).
 
@@ -138,12 +144,11 @@ Capacity and throughput are in tasks/tick. \* = feasible at that rate but infeas
 1. **The leaderboard metric doesn't predict usable capacity.**
    * Kitty_Knight has the highest pool throughput on this instance, but no tested arrival rate gets its misses under 1%.
    * Across the 8 solvers, the Spearman rank correlation between pool throughput and deadline capacity ranges from −0.29 to +0.51 depending on scenario and deadline. None is significant (p ≥ 0.19, n = 8).
-2. **Several solvers get *worse* as load drops.** Miss rates for Kitty_Knight, the 2024 default and both staging variants fall as the arrival rate rises (the U-shaped curves above). With a 3000-tick horizon at 0.05 tasks/tick, only about 147 tasks arrive in a run. Of those, these are still open at the end:
+2. **Several solvers get *worse* as load drops.** Miss rates for Kitty_Knight and the 2024 default fall as the arrival rate rises (the U-shaped curves above). With a 3000-tick horizon at 0.05 tasks/tick, only about 147 tasks arrive in a run. Of those, these are still open at the end:
 
    | Solver | Tasks still open |
    |---|---|
    | Kitty_Knight | 26 |
-   | staging variants | 28–31 |
    | 2024 default | 19 |
    | 2026 default | 17 |
    | oldest-first, least-slack | 7.5–8 |
@@ -156,8 +161,6 @@ Capacity and throughput are in tasks/tick. \* = feasible at that rate but infeas
    |---|---|---|---|
    | Kitty_Knight @ 0.05 | 0.1% | 90% | 89% |
    | 2024 default @ 0.1 | 0% | 90% | 82% |
-   | staging (on errand) @ 0.1 | 3% | 80% | 68% |
-   | staging (next to errand) @ 0.1 | 3% | 82% | 75% |
    | 2026 default @ 0.3 | 4% | 57% | 20% |
    | No Man's Sky @ 0.05 / 0.1 / 0.7 | — | 1 late task each | — |
 
@@ -177,8 +180,7 @@ The videos in `results/videos/` (900 ticks each, identical arrivals on both side
 | `2_winner_vs_runnerup` | No Man's Sky vs Kitty_Knight at 0.7: same throughput (0.62 vs 0.60), p99 210 vs 344 |
 | `3_lowload_winner_vs_runnerup` | the same pair at 0.05: Kitty_Knight's tasks pile up behind idle robots (p99 889 vs 379) |
 | `4_lowload_2024_default_vs_winner` | 2024 default vs No Man's Sky at 0.1 (p99 619 vs 233) |
-| `5_staging_on_vs_next_to_errand` | parking on vs next to errand cells at 0.1: both fail (p99 711 vs 703) |
-| `6_kitchen_service_times` | 2026 default vs oldest-first with kitchen service at 0.2 (p99 589 vs 358) |
+| `5_kitchen_service_times` | 2026 default vs oldest-first with kitchen service at 0.2 (p99 589 vs 358) |
 
 ## What the original chat got right and wrong
 
@@ -192,12 +194,11 @@ This repo re-implements the benchmark from the chat, since the chat's zip files 
 | The 2024 default works with random arrivals | ✅ But a naive patch breaks it: the 2024 kit clears `new_tasks` inside `reveal_tasks`, and skipping that line makes the entry re-assign finished tasks. This repo's first patch had exactly that bug (fixed). |
 | 2026 Start-Kit writes the first snapshot into every path segment | ✅ `Simulator.cpp` uses `chunked_actual_snapshot_states[i][0]`. Also found: the first schedule entry carries an uninitialised timestep. |
 | Greedy fails because far tasks starve | ❌ (the chat later retracted this) Late tasks are assigned more than 93% of the time. |
-| Correction: idle robots that never move block busy ones | ✅ For Kitty_Knight, the 2024 default and staging (68–89% of stuck time next to an idle robot). ❌ For the 2026 default, whose late tasks are congested among busy robots. |
+| Correction: idle robots that never move block busy ones | ✅ For Kitty_Knight and the 2024 default (82–89% of stuck time next to an idle robot). ❌ For the 2026 default, whose late tasks are congested among busy robots. |
 | 2026 default's p99 gets worse as load drops (443 vs 212 ticks) | ❌ Not reproduced: its miss rate rises steadily with load. The low-load pathology is real, but it belongs to other solvers. |
 | Rank correlation throughput ↔ capacity = −0.22 | ⚠️ Here −0.29 to +0.51, never significant. The conclusion (throughput rank says little) holds; the number doesn't. |
 | No Man's Sky keeps all capacity under Poisson, loses 36% bursty, 50% kitchen | ⚠️ Here it loses 34% / 53% / 53%. The direction holds. Part of the Poisson loss is grid resolution (0.7 → 1.0). |
 | Kitty_Knight misses the deadline at every load | ✅ |
-| Naive staging (parking on errand cells) backfires | ✅ Parking *next to* errand cells doesn't help either: the cost comes from parked robots not yielding, not from the cell they choose. |
 | Throughput comparisons across kits (0.93 vs 2.43 tasks/tick) | ⚠️ Mixes kit effects. The 2026 kit halves the same greedy scheduler's throughput, so compare within a kit. |
 
 ## Caveats

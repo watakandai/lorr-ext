@@ -37,6 +37,7 @@ MISS_OK = 0.01
 def load(runs: Path) -> pd.DataFrame:
     rows = [json.loads(p.read_text()) for p in sorted((runs / "rows").glob("*.json"))]
     df = pd.DataFrame(rows)
+    df = df[df.solver.isin(list(SOLVERS))]  # e.g. drop retired baselines from older runs
     df["ok"] = (df["returncode"] == 0) & df["throughput"].notna() if "throughput" in df else False
     df["scenario"] = df.apply(scenario, axis=1)
     return df
@@ -48,8 +49,11 @@ def scenario(r) -> str:
     s = r["arrival"]
     if r["service"] != "none":
         s += "+" + r["service"]
-    if r["p_delay"] > 0:
+    if r["p_delay"] > 0:  # older runs used the kit's own uniform delays
         s += f"+delay{r['p_delay']:g}"
+    d = r.get("delay", "none")
+    if isinstance(d, str) and d != "none":
+        s += f"+delay:{d}"
     return s
 
 
@@ -92,7 +96,8 @@ def rank_corr(t: pd.DataFrame, sc: str, subset=None) -> tuple[float, float, int]
 
 
 def plot_latency(df: pd.DataFrame, out: Path, D: int = 300) -> None:
-    scs = [s for s in ["poisson", "mmpp", "hawkes", "poisson+kitchen", "poisson+delay0.05", "mmpp+delay0.05"]
+    scs = [s for s in ["poisson", "mmpp", "hawkes", "poisson+kitchen", "poisson+delay0.05", "mmpp+delay0.05",
+                       "poisson+delay:kit_like", "poisson+delay:congestion"]
            if s in set(df.scenario)]
     fig, axes = plt.subplots(2, (len(scs) + 1) // 2, figsize=(5.2 * ((len(scs) + 1) // 2), 8), squeeze=False)
     cmap = plt.get_cmap("tab10")

@@ -1,22 +1,26 @@
-// LoRR-Ext: known arrival processes, hidden interval service times and
-// per-task latency records for the League of Robot Runners Start-Kit.
+// LoRR-Ext: known arrival processes, location-dependent uncertain service times
+// and move delays, and per-task latency records for the League of Robot
+// Runners Start-Kit.
 //
 // Header-only so it builds unchanged inside the 2026 kit and the 2024-season
 // kits used by archived entries (some of which list sources by hand in CMake).
-// It is wired in by tools/patch_kit.py through four hooks:
+// It is wired in by tools/patch_kit.py through these hooks:
 //   driver.cpp         LorrExt::configure(data, team_size)
-//   TaskManager.cpp    LorrExt::reveal(...)        start of reveal_tasks
-//                      LorrExt::stop_reached(...)  replaces the "agent is on its
-//                                                  next errand" test
-//   CompetitionSystem  LorrExt::save(...)          inside saveResults
+//   TaskManager.cpp    LorrExt::reveal(...)          wraps the reveal loop
+//                      LorrExt::stop_reached(...)    replaces the "agent is on
+//                                                    its next errand" test
+//   CompetitionSystem  LorrExt::save(...)            inside saveResults
+//   Simulator.cpp      LorrExt::simulate_delay(...)  2026 kit only
 // With no "lorrExt" object in the input JSON every hook is a no-op and the kit
 // behaves exactly as released.
 //
-// Schedulers may read the *known* model through LorrExt::cfg() and
-// LorrExt::service_interval(); the realised service time stays hidden.
+// Schedulers may read the *known* model (distributions per cell) through
+// LorrExt::service_mean_at / service_quantile_at / delay_rule_at; realised
+// service times and delays stay hidden.
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <list>
@@ -29,7 +33,7 @@
 
 #include "nlohmann/json.hpp"
 
-// Known distribution of one errand's service (dwell) time, in ticks.
+// A known distribution of a duration in ticks (service time or delay length).
 //   uniform    : integer U{lo, hi} (the "interval" setting)
 //   exponential: mean                      (cv is 1 by definition)
 //   lognormal  : mean, cv                  (right-skewed, never negative)
@@ -124,13 +128,27 @@ struct LorrExtConfig
     double decay = 0.05; // beta
     uint64_t arrivalSeed = 0;
 
-    // ---- service times -------------------------------------------------
-    // Errand j of every task needs the robot to be on the errand cell for d
-    // ticks (cumulative; being pushed off pauses the clock), with
-    // d ~ service[j % size]. Empty => instantaneous (the original kit).
+    int mapCols = 0;                 // to turn [row, col] into a cell index
+
+    // ---- service times (per cell) ---------------------------------------
+    // An errand at cell v needs the robot to stay on v for d ticks
+    // (cumulative; being pushed off pauses the clock), d ~ service[cell2svc[v]].
+    // Cells without an entry use serviceDefault (-1 = instantaneous).
     std::vector<ServiceDist> service;
+    std::unordered_map<int, int> cell2svc;
+    int serviceDefault = -1;
     uint64_t serviceSeed = 0;
     double serviceQuantile = 0.95;   // the "safe" duration baselines plan with
+
+    // ---- move delays (per cell, 2026 kit) ---------------------------------
+    // Each tick a robot on cell v that is not already delayed gets stuck with
+    // probability p(v) for d ~ delay length distribution of v. Cells without an
+    // entry use delayDefault (-1 = never delayed).
+    struct DelayRule { double p = 0; ServiceDist length; };
+    std::vector<DelayRule> delay;
+    std::unordered_map<int, int> cell2delay;
+    int delayDefault = -1;
+    uint64_t delaySeed = 0;
 
     // ---- metrics / baselines --------------------------------------------
     int deadline = 300;              // informational; analysis can re-threshold
@@ -156,6 +174,10 @@ struct LorrExt
         std::unordered_map<int64_t, std::pair<int, int>> served;
         std::unordered_map<int, int> last_seen; // agent -> last check tick
         std::vector<std::pair<int, int>> arrivals_per_tick; // (t, n) with n>0
+        // per-cell delays
+        std::vector<int> remaining_delay;
+        int delay_tick = 0;
+        std::vector<std::array<int, 3>> delay_events; // (agent, start tick, length)
     };
     static State &st()
     {
@@ -186,34 +208,74 @@ struct LorrExt
             c.decay = get(a, "decay", c.decay);
             c.arrivalSeed = get(a, "seed", c.arrivalSeed);
         }
+        c.mapCols = get(j, "mapCols", c.mapCols);
+        auto parse_dist = [&](const nlohmann::json &o) {
+            ServiceDist d;
+            d.type = get(o, "dist", std::string("fixed"));
+            d.lo = get(o, "lo", 0.0); d.hi = get(o, "hi", 0.0);
+            d.mean = get(o, "mean", 0.0); d.cv = get(o, "cv", 0.0);
+            d.min = get(o, "min", d.type == "uniform" ? d.lo : 0.0);
+            d.max = get(o, "max", d.type == "uniform" ? d.hi : 1e9);
+            d.build_quantiles();
+            return d;
+        };
+        auto cells_of = [&](const nlohmann::json &o) {
+            std::vector<int> out;
+            if (o.contains("cells"))
+                for (const auto &rc : o["cells"])
+                {
+                    if (c.mapCols <= 0)
+                        throw std::invalid_argument("lorrExt.mapCols is required when cells are listed");
+                    out.push_back(rc[0].get<int>() * c.mapCols + rc[1].get<int>());
+                }
+            return out;
+        };
+        // "service": {"default": {dist...} | null,
+        //             "cells": [{"cells": [[r, c], ...], "dist": "lognormal", "mean": 20, "cv": 0.5}, ...],
+        //             "seed": 0, "planQuantile": 0.95}
         if (j.contains("service"))
         {
             const auto &s = j["service"];
-            // "intervals": [[lo, hi], ...]  (shorthand for uniform)
-            if (s.contains("intervals"))
-                for (const auto &iv : s["intervals"])
+            if (s.contains("default") && !s["default"].is_null())
+            {
+                c.service.push_back(parse_dist(s["default"]));
+                c.serviceDefault = int(c.service.size()) - 1;
+            }
+            if (s.contains("cells"))
+                for (const auto &g : s["cells"])
                 {
-                    ServiceDist d;
-                    d.lo = iv[0].get<int>(); d.hi = iv[1].get<int>();
-                    d.min = d.lo; d.max = d.hi;
-                    c.service.push_back(d);
+                    c.service.push_back(parse_dist(g));
+                    for (int v : cells_of(g))
+                        c.cell2svc[v] = int(c.service.size()) - 1;
                 }
-            // "stops": [{"dist": "lognormal", "mean": 20, "cv": 0.5, "min": 1, "max": 200}, ...]
-            if (s.contains("stops"))
-                for (const auto &o : s["stops"])
-                {
-                    ServiceDist d;
-                    d.type = get(o, "dist", std::string("fixed"));
-                    d.lo = get(o, "lo", 0.0); d.hi = get(o, "hi", 0.0);
-                    d.mean = get(o, "mean", 0.0); d.cv = get(o, "cv", 0.0);
-                    d.min = get(o, "min", d.type == "uniform" ? d.lo : 0.0);
-                    d.max = get(o, "max", d.type == "uniform" ? d.hi : 1e9);
-                    c.service.push_back(d);
-                }
-            for (auto &d : c.service)
-                d.build_quantiles();
             c.serviceSeed = get(s, "seed", c.serviceSeed);
             c.serviceQuantile = get(s, "planQuantile", c.serviceQuantile);
+        }
+        // "delay": {"default": {"p": 0.01, "dist": "uniform", "lo": 1, "hi": 4} | null,
+        //           "cells": [{"cells": [[r, c], ...], "p": 0.1, "dist": "gamma", "mean": 3, "cv": 0.5}, ...],
+        //           "seed": 0}
+        if (j.contains("delay"))
+        {
+            const auto &dl = j["delay"];
+            auto rule = [&](const nlohmann::json &o) {
+                LorrExtConfig::DelayRule r;
+                r.p = get(o, "p", 0.0);
+                r.length = parse_dist(o);
+                return r;
+            };
+            if (dl.contains("default") && !dl["default"].is_null())
+            {
+                c.delay.push_back(rule(dl["default"]));
+                c.delayDefault = int(c.delay.size()) - 1;
+            }
+            if (dl.contains("cells"))
+                for (const auto &g : dl["cells"])
+                {
+                    c.delay.push_back(rule(g));
+                    for (int v : cells_of(g))
+                        c.cell2delay[v] = int(c.delay.size()) - 1;
+                }
+            c.delaySeed = get(dl, "seed", c.delaySeed);
         }
         c.deadline = get(j, "deadline", c.deadline);
         c.scheduler = get(j, "scheduler", c.scheduler);
@@ -223,40 +285,87 @@ struct LorrExt
     static bool custom_arrivals() { return cfg().enabled && cfg().arrival != "pool"; }
 
     // ---- what a scheduler may know: the distribution, not the draw ----
-    static const ServiceDist *service_dist(int stop_idx)
+    static const ServiceDist *service_dist_at(int cell)
     {
-        const auto &sv = cfg().service;
-        if (!cfg().enabled || sv.empty())
+        const auto &c = cfg();
+        if (!c.enabled || c.service.empty())
             return nullptr;
-        return &sv[stop_idx % sv.size()];
+        auto it = c.cell2svc.find(cell);
+        int i = it != c.cell2svc.end() ? it->second : c.serviceDefault;
+        return i >= 0 ? &c.service[i] : nullptr;
     }
-    static double service_mean(int stop_idx)
+    static double service_mean_at(int cell)
     {
-        auto *d = service_dist(stop_idx);
+        auto *d = service_dist_at(cell);
         return d ? d->expected() : 0.0;
     }
-    static int service_quantile(int stop_idx, double q)
+    static int service_quantile_at(int cell, double q)
     {
-        auto *d = service_dist(stop_idx);
+        auto *d = service_dist_at(cell);
         return d ? d->quantile(q) : 0;
     }
-    // kept for the interval setting: (lo, hi) = (q0, q1)
-    static std::pair<int, int> service_interval(int stop_idx)
-    {
-        return {service_quantile(stop_idx, 0.0), service_quantile(stop_idx, 1.0)};
-    }
+    static bool has_service() { return cfg().enabled && !cfg().service.empty(); }
 
-    // Hidden realised service time: drawn from a generator seeded by a hash of
-    // (seed, task, stop), so it is the same for every solver and call order.
-    static int service_time(int task_id, int stop_idx)
+    // Hidden realised service time of the errand of `task_id` at `cell`: drawn
+    // from a generator seeded by a hash of (seed, task, errand index), so it is
+    // the same for every solver and call order.
+    static int service_time(int task_id, int stop_idx, int cell)
     {
-        auto *d = service_dist(stop_idx);
+        auto *d = service_dist_at(cell);
         if (!d)
             return 0;
-        uint64_t x = cfg().serviceSeed * 0x9E3779B97F4A7C15ULL ^ (uint64_t(task_id) << 20) ^ uint64_t(stop_idx);
-        x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL; x ^= x >> 33;
-        std::mt19937_64 g(x);
+        std::mt19937_64 g(mix(cfg().serviceSeed * 0x9E3779B97F4A7C15ULL ^ (uint64_t(task_id) << 20) ^ uint64_t(stop_idx)));
         return d->draw(g);
+    }
+
+    static uint64_t mix(uint64_t x)
+    {
+        x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL; x ^= x >> 33;
+        return x;
+    }
+
+    // ---- per-cell move delays (2026 kit) --------------------------------
+    static const LorrExtConfig::DelayRule *delay_rule_at(int cell)
+    {
+        const auto &c = cfg();
+        if (!c.enabled || c.delay.empty())
+            return nullptr;
+        auto it = c.cell2delay.find(cell);
+        int i = it != c.cell2delay.end() ? it->second : c.delayDefault;
+        return i >= 0 ? &c.delay[i] : nullptr;
+    }
+
+    // Hook at the start of Simulator::simulate_delay. When a delay map is
+    // configured it replaces the kit's location-blind generator: returns true
+    // and sets every robot's inDelay flag itself.
+    template <class States>
+    static bool simulate_delay(States &curr_states, int n)
+    {
+        const auto &c = cfg();
+        if (!c.enabled || c.delay.empty())
+            return false;
+        auto &s = st();
+        if ((int)s.remaining_delay.size() != n)
+            s.remaining_delay.assign(n, 0);
+        for (int a = 0; a < n; a++)
+        {
+            if (s.remaining_delay[a] > 0)
+                s.remaining_delay[a]--;
+            if (s.remaining_delay[a] == 0)
+                if (auto *r = delay_rule_at(curr_states[a].location); r && r->p > 0)
+                {
+                    std::mt19937_64 g(mix(c.delaySeed * 0x9E3779B97F4A7C15ULL ^ (uint64_t(a) << 32) ^ uint64_t(s.delay_tick)));
+                    if (std::uniform_real_distribution<double>(0, 1)(g) < r->p)
+                    {
+                        int len = std::max(1, r->length.draw(g));
+                        s.remaining_delay[a] = len;
+                        s.delay_events.push_back({a, s.delay_tick, len});
+                    }
+                }
+            curr_states[a].delay.inDelay = s.remaining_delay[a] > 0;
+        }
+        s.delay_tick++;
+        return true;
     }
 
     // Number of arrivals in tick t (advances the process by one tick).
@@ -336,7 +445,7 @@ struct LorrExt
             st().last_seen.erase(k);
             return false;
         }
-        if (!cfg().enabled || cfg().service.empty())
+        if (!has_service() || !service_dist_at(location))
             return true;
         int t = tm.curr_timestep;
         auto &s = st();
@@ -349,7 +458,7 @@ struct LorrExt
         if (sv.first != k)
             sv = {k, 0}; // a different robot took over this stop: the clock restarts
         sv.second += inc;
-        if (sv.second >= service_time(task->task_id, task->idx_next_loc))
+        if (sv.second >= service_time(task->task_id, task->idx_next_loc, location))
         {
             s.served.erase(key);
             s.last_seen.erase(k);
@@ -370,12 +479,28 @@ struct LorrExt
         ext["deadline"] = c.deadline;
         ext["scheduler"] = c.scheduler;
         ext["simulationTime"] = simulation_time;
+        auto dist_json = [](const ServiceDist &d) {
+            return nlohmann::ordered_json{{"dist", d.type}, {"lo", d.lo}, {"hi", d.hi}, {"mean", d.mean}, {"cv", d.cv},
+                                          {"min", d.min}, {"max", std::min(d.max, 1e6)}, {"expected", d.expected()},
+                                          {"q05", d.quantile(0.05)}, {"q50", d.quantile(0.5)}, {"q95", d.quantile(0.95)}};
+        };
         nlohmann::ordered_json sv = nlohmann::ordered_json::array();
         for (auto &d : c.service)
-            sv.push_back({{"dist", d.type}, {"lo", d.lo}, {"hi", d.hi}, {"mean", d.mean}, {"cv", d.cv},
-                          {"min", d.min}, {"max", std::min(d.max, 1e6)},
-                          {"q05", d.quantile(0.05)}, {"q50", d.quantile(0.5)}, {"q95", d.quantile(0.95)}});
+            sv.push_back(dist_json(d));
         ext["service"] = sv;
+        ext["serviceDefault"] = c.serviceDefault;
+        nlohmann::ordered_json dl = nlohmann::ordered_json::array();
+        for (auto &r : c.delay)
+        {
+            auto o = dist_json(r.length);
+            o["p"] = r.p;
+            dl.push_back(o);
+        }
+        ext["delay"] = dl;
+        nlohmann::ordered_json ev = nlohmann::ordered_json::array();
+        for (auto &e : st().delay_events)
+            ev.push_back({e[0], e[1], e[2]});
+        ext["delayEvents"] = ev; // [agent, start tick, length]
         // [task_id, t_revealed, t_completed (-1 = open), agent, n_stops]
         nlohmann::ordered_json recs = nlohmann::ordered_json::array();
         for (auto *t : tm.all_tasks)

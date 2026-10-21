@@ -23,7 +23,8 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from lorrext import arrivals  # noqa: E402
-from lorrext.core import Setting, bfs_from, service_stops, task_length  # noqa: E402
+from lorrext import cellmaps  # noqa: E402
+from lorrext.core import FREE, Setting, bfs_from, task_length  # noqa: E402
 from lorrext.replay import _index_events, load, read_map  # noqa: E402
 
 OUT = ROOT / "docs" / "figures"
@@ -70,8 +71,9 @@ def fig_system_loop():
     # LoRR-Ext additions
     kw = dict(fontsize=8.5, color=RED, ha="left", va="top")
     ax.text(0.2, 3.15, "LoRR-Ext ①  arrivals: when do new tasks appear?\n(pool = keep 150 open; or Poisson / bursty)", **kw)
-    ax.text(0.2, 1.75, "LoRR-Ext ②  service time:\nrobot must stay d ticks on\nthe errand cell (d ~ known\ndistribution, value hidden)", **kw)
+    ax.text(0.2, 1.3, "LoRR-Ext ②  service time:\nrobot must stay on the errand\ncell for a time drawn from that\nCELL's known distribution\n(value hidden)", **kw)
     ax.text(7.25, 1.35, "LoRR-Ext ③  per-task records:\nrevealed, completed → latency,\ndeadline misses, CVaR …", **kw)
+    ax.text(7.25, 0.55, "LoRR-Ext ④  move delays (2026 kit):\nrobot on cell v gets stuck w.p. p(v),\nfor a time drawn from v's distribution", **kw)
     ax.text(5.5, 5.25, "One tick of the simulation loop (repeats every tick; the planner may plan several ticks ahead)",
             ha="center", fontsize=10.5, weight="bold")
     save(fig, "01_system_loop.png")
@@ -149,7 +151,7 @@ def fig_actions():
 
 # --------------------------------------------------------------------- 4
 def fig_task_life():
-    rp = load(ROOT / "runs" / "distcheck" / "out" / "nms2024__pool1.5_kitchen_dist_d0_s0_T500.json")
+    rp = load(ROOT / "runs" / "cellcheck" / "out" / "nms2024__pool1.5_kitchen_d0_s0_T600.json")
     _index_events(rp)
     cand = [i for i, tk in rp.tasks.items() if tk["done"] > 0 and len(tk["locs"]) >= 3 and tk["reveal"] > 60]
     tid = sorted(cand, key=lambda i: rp.tasks[i]["done"] - rp.tasks[i]["reveal"])[len(cand) // 2]
@@ -179,7 +181,7 @@ def fig_task_life():
             ha="center", va="top", fontsize=9.5)
     ax.axvline(tk["reveal"], color="k", lw=0.8, ls=":"); ax.axvline(tk["done"], color="k", lw=0.8, ls=":")
     ax.set_yticks([]); ax.set_ylim(-1.9, 1.0); ax.set_xlabel("tick")
-    ax.set_title(f"Life of one task (No Man's Sky, pool mode, kitchen service times): task {tid}, {len(tk['locs'])} errands, robot {a}",
+    ax.set_title(f"Life of one task (No Man's Sky, pool mode, 'kitchen' service map): task {tid}, {len(tk['locs'])} errands, robot {a}",
                  fontsize=10)
     save(fig, "04_task_life.png")
 
@@ -209,24 +211,53 @@ def fig_pool_vs_arrivals():
 
 
 # --------------------------------------------------------------------- 6
-def fig_service_dists():
-    specs = [("10-30", "uniform interval 10–30"), ("fixed:20", "fixed 20"), ("normal:20:0.3", "normal, cv 0.3"),
-             ("gamma:20:0.5", "gamma, cv 0.5"), ("lognormal:20:0.5", "lognormal, cv 0.5"), ("exponential:20", "exponential (cv 1)")]
-    fig, axes = plt.subplots(2, 3, figsize=(12, 5.4), sharex=True)
-    for ax, (spec, title) in zip(axes.flat, specs):
-        x = arrivals.service_samples(service_stops(spec)[0], n=50000)
-        ax.hist(x, bins=np.arange(0, 91) - 0.5, density=True, color=ORANGE, alpha=0.8)
-        for q, ls in ((50, "-"), (95, "--")):
-            v = np.percentile(x, q)
-            ax.axvline(v, color="k", ls=ls, lw=1)
-            ax.text(v + 1, ax.get_ylim()[1] * (0.85 if q == 50 else 0.65), f"p{q}={v:.0f}", fontsize=8)
-        ax.set_title(f"{title}   `{spec}`", fontsize=9)
-        ax.set_yticks([])
-    for ax in axes[1]:
-        ax.set_xlabel("service time (ticks)")
-    fig.suptitle("Service-time options, all with mean 20 ticks. The scheduler knows the shape; each draw stays hidden.\n"
-                 "Same mean, very different tails: p95 is what you must budget for a 95% guarantee.", fontsize=10.5)
-    save(fig, "06_service_distributions.png")
+def _map_panel(ax, grid, title, cmap, label):
+    im = ax.imshow(np.where(FREE, grid, np.nan), cmap=cmap, interpolation="nearest")
+    ax.imshow(np.where(FREE, np.nan, 1.0), cmap="Greys", vmin=0, vmax=1.6, interpolation="nearest")
+    ax.set_xticks([]); ax.set_yticks([]); ax.set_title(title, fontsize=9.5)
+    plt.colorbar(im, ax=ax, fraction=0.046, label=label)
+
+
+def fig_service_map():
+    m = cellmaps.build("kitchen", "service", FREE)
+    fig = plt.figure(figsize=(13, 4.6))
+    gs = fig.add_gridspec(2, 3, width_ratios=[1.25, 1, 1], wspace=0.35, hspace=0.6)
+    ax = fig.add_subplot(gs[:, 0])
+    _map_panel(ax, cellmaps.per_cell(m, FREE, "mean"), "preset 'kitchen': each cell belongs to a work zone;\ncolour = expected service time there",
+               "viridis", "expected service (ticks)")
+    h, w = FREE.shape
+    for (r, c), g in zip([(h * .25, w * .25), (h * .25, w * .75), (h * .75, w * .25), (h * .75, w * .75)], m["cells"]):
+        ax.text(c, r, g["name"], ha="center", va="center", fontsize=8, color="white", weight="bold",
+                bbox=dict(fc="black", alpha=0.45, ec="none", pad=1.5))
+    for i, g in enumerate(m["cells"]):
+        ax2 = fig.add_subplot(gs[i // 2, 1 + i % 2])
+        x = arrivals.service_samples(g, n=30000)
+        ax2.hist(x, bins=np.arange(0, x.max() + 2) - 0.5, density=True, color=ORANGE, alpha=0.85)
+        q50, q95 = np.percentile(x, [50, 95])
+        ax2.axvline(q50, color="k", lw=1); ax2.axvline(q95, color="k", lw=1, ls="--")
+        spec = f"{g['dist']}" + (f" mean {g['mean']:g}, cv {g['cv']:g}" if g["dist"] != "uniform" else f" {g['lo']}-{g['hi']}")
+        ax2.set_title(f"{g['name']}: {spec}\np50 = {q50:.0f} (solid), p95 = {q95:.0f} (dashed)", fontsize=8.5)
+        ax2.set_yticks([]); ax2.set_xlabel("ticks", fontsize=8)
+    fig.suptitle("Service time depends on WHERE the errand is (as you'd estimate from past data at each station).\n"
+                 "The scheduler can read each cell's distribution; the actual duration of a given task stays hidden.",
+                 fontsize=10.5, y=1.04)
+    save(fig, "06_service_map.png")
+
+
+def fig_delay_map():
+    m = cellmaps.build("congestion", "delay", FREE)
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.3), gridspec_kw=dict(width_ratios=[1.2, 1]))
+    _map_panel(axes[0], cellmaps.per_cell(m, FREE, "p"),
+               "preset 'congestion': chance per tick that a robot\non the cell gets stuck (narrow passages are risky)", "magma", "p (per tick)")
+    for g, col, lab in ((m["default"], GREY, "elsewhere (p = 0.002): uniform 1–2"),
+                        (m["cells"][0], RED, "narrow passage (p = 0.05): lognormal mean 4, cv 0.6")):
+        x = arrivals.service_samples(g, n=30000)
+        axes[1].hist(x, bins=np.arange(0, 16) - 0.5, density=True, alpha=0.6, color=col, label=lab)
+    axes[1].set_xlabel("delay length (ticks)"); axes[1].set_yticks([]); axes[1].legend(fontsize=8)
+    axes[1].set_title("how long a robot is stuck once a delay hits", fontsize=9.5)
+    fig.suptitle("Move delays per cell (2026 kit). Default is NO delays (deterministic travel); the kit's own model is\n"
+                 "location-blind (same p everywhere, uniform length) and is available as preset 'kit_like'.", fontsize=10.5, y=1.05)
+    save(fig, "07_delay_map.png")
 
 
 # --------------------------------------------------------------------- 7
@@ -253,8 +284,8 @@ def fig_schedulers():
     panels = [("greedy (2024/2026 default)\neach free robot takes its NEAREST task", greedy()),
               ("oldest-first (fifo)\noldest task gets the nearest free robot", by_order(oldest)),
               (f"least-slack (D = {D})\nsmallest  D − age − path − p95(service)  first", by_order(slack))]
-    fig, axes = plt.subplots(1, 4, figsize=(15, 4))
-    for ax, (title, asg) in zip(axes[:3], panels):
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4.2))
+    for ax, (title, asg) in zip(axes, panels):
         ax.set_xlim(-0.5, 8.5); ax.set_ylim(8.5, -0.5); ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
         for i in range(10):
             ax.axhline(i - 0.5, color="#eee"); ax.axvline(i - 0.5, color="#eee")
@@ -270,18 +301,8 @@ def fig_schedulers():
             ax.annotate("", xy=(c2, r2), xytext=(c1, r1), arrowprops=dict(arrowstyle="-|>", color=GREEN, lw=2), zorder=2)
         left = [t for t in tasks if t not in asg.values()]
         ax.set_title(title + f"\n→ waits: {', '.join(left)} (age {tasks[left[0]][1]})", fontsize=9)
-    ax = axes[3]
-    ax.set_xlim(-0.5, 8.5); ax.set_ylim(8.5, -0.5); ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
-    for i in range(10):
-        ax.axhline(i - 0.5, color="#eee"); ax.axvline(i - 0.5, color="#eee")
-    for (r, c) in [(2, 2), (5, 1), (7, 7)]:
-        ax.add_patch(mp.Rectangle((c - 0.4, r - 0.4), 0.8, 0.8, color="#ffe8a3"))
-    for (r, c), (r2, c2) in [((0, 5), (2, 2)), ((8, 3), (5, 1))]:
-        ax.add_patch(mp.Circle((c, r), 0.35, color=GREY, zorder=3))
-        ax.annotate("", xy=(c2, r2), xytext=(c, r), arrowprops=dict(arrowstyle="-|>", color=GREY, lw=2, ls="--"))
-    ax.set_title("staging (idle robots only)\nidle robots drive to where tasks\nrecently started (yellow) and park", fontsize=9)
     fig.suptitle("Task assignment rules on a toy example (3 free robots, 4 open tasks; colour = task age)", fontsize=10.5)
-    save(fig, "07_schedulers.png")
+    save(fig, "08_schedulers.png")
 
 
 # --------------------------------------------------------------------- 8
@@ -309,10 +330,38 @@ def fig_pibt():
     fig.suptitle("Planner core, PIBT (Priority Inheritance with Backtracking): every tick, robots in priority order pick their best next cell;"
                  "\na robot in the way inherits the priority and is pushed. If it can't move, the requester backtracks and tries another cell.",
                  fontsize=9.5)
-    save(fig, "08_pibt.png")
+    save(fig, "09_pibt.png")
 
 
-# --------------------------------------------------------------------- 9
+# --------------------------------------------------------------------- 10
+def fig_travel_time():
+    from lorrext.travel import interval_table, legs
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.3), sharey=True)
+    for ax, (key, label, col) in zip(axes, [("nms2024", "No Man's Sky (2024 kit)", BLUE),
+                                              ("default2026", "2026 default (2026 kit)", RED)]):
+        df = legs(EXPLAIN / f"{key}__pool1.5_none_d0_s0_T1000.json")
+        jit = np.random.default_rng(0).uniform(-0.3, 0.3, len(df))
+        ax.scatter(df.d + jit, df.actual, s=3, alpha=0.15, color=col)
+        t = interval_table(df, bins=tuple(range(0, 56, 5)))
+        mid = t.mean_d.values
+        ax.fill_between(mid, t.q05, t.q95, color=col, alpha=0.2, label="90% prediction interval (q05–q95)")
+        ax.plot(mid, t.q50, color=col, lw=2, label="median actual")
+        x = np.arange(0, 56)
+        ax.plot(x, x, "k--", lw=1, label="heuristic: actual = d")
+        fr = df.groupby("d").d_free.mean()
+        ax.plot(fr.index, fr.values, "k:", lw=1.2, label="empty map, incl. turns")
+        ax.set_xlabel("grid distance d to the next errand (moves)")
+        lost = df.lost_to_others
+        ax.set_title(f"{label}: actual ≈ {np.median(df.actual / df.d.clip(lower=1)):.1f}× d (median)\n"
+                     f"time lost to other robots: median {lost.median():.0f}, p95 {lost.quantile(.95):.0f} ticks", fontsize=9.5)
+        ax.set_xlim(0, 55); ax.set_ylim(0, 160)
+    axes[0].set_ylabel("actual ticks to get there"); axes[0].legend(fontsize=7.5, loc="upper left")
+    fig.suptitle("Travel time is longer than the map distance, but predictably so: quantiles per distance give an interval\n"
+                 "(every leg of every task in a 1000-tick pool run; python -m lorrext.travel)", fontsize=10.5, y=1.04)
+    save(fig, "10_travel_time.png")
+
+
+# --------------------------------------------------------------------- 11
 def fig_latency_metrics():
     from lorrext.core import latencies
     fig, axes = plt.subplots(1, 2, figsize=(12.5, 3.8), sharey=True)
@@ -336,7 +385,7 @@ def fig_latency_metrics():
     axes[0].set_ylabel("number of tasks")
     fig.suptitle("Latency distribution in pool mode: the mean says little; the tail (p99, CVaR95, misses past D) is where solvers differ",
                  fontsize=10.5)
-    save(fig, "09_latency_metrics.png")
+    save(fig, "11_latency_metrics.png")
 
 
 # --------------------------------------------------------------------- 10
@@ -363,13 +412,14 @@ def fig_capacity():
     ax.text(1.28, (pool + 0.7) / 2, f"G = 1 − {0.7:.2f}/{pool:.2f}\n  = {1 - 0.7 / pool:.2f}", color=RED, fontsize=9, va="center")
     ax.set_ylabel("tasks/tick"); ax.set_xlim(-0.5, 2.0)
     ax.set_title("SLA gap G: share of leaderboard\nthroughput unusable under the deadline", fontsize=9.5)
-    save(fig, "10_capacity_gap.png")
+    save(fig, "12_capacity_gap.png")
 
 
 # --------------------------------------------------------------------- 11
 def fig_littles_law():
     df = pd.read_csv(ROOT / "results" / "runs.csv")
-    p = df[df.scenario == "pool"].groupby("solver")[["throughput", "lat_mean"]].mean()
+    from lorrext.core import SOLVERS
+    p = df[(df.scenario == "pool") & df.solver.isin(list(SOLVERS))].groupby("solver")[["throughput", "lat_mean"]].mean()
     fig, ax = plt.subplots(figsize=(6.2, 4.2))
     x = np.linspace(0.35, 1.2, 50)
     ax.plot(x, 150 / x, color="k", lw=1, label="Little's law: W = L / λ = 150 / throughput")
@@ -379,10 +429,10 @@ def fig_littles_law():
     ax.set_xlabel("throughput λ (tasks/tick)"); ax.set_ylabel("mean latency W (ticks)")
     ax.legend(fontsize=7.5)
     ax.set_title("In pool mode L = 150 open tasks always, so the mean latency is\nfixed by throughput (measured values sit ~20% low because\ntasks still open at the end are counted at their age so far)", fontsize=9)
-    save(fig, "11_littles_law.png")
+    save(fig, "13_littles_law.png")
 
 
 if __name__ == "__main__":
-    for f in (fig_system_loop, fig_world, fig_actions, fig_task_life, fig_pool_vs_arrivals, fig_service_dists,
-              fig_schedulers, fig_pibt, fig_latency_metrics, fig_capacity, fig_littles_law):
+    for f in (fig_system_loop, fig_world, fig_actions, fig_task_life, fig_pool_vs_arrivals, fig_service_map,
+              fig_delay_map, fig_schedulers, fig_pibt, fig_travel_time, fig_latency_metrics, fig_capacity, fig_littles_law):
         f()

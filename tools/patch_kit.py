@@ -64,7 +64,7 @@ def patch(kit: Path, kitty_guard: bool = False, stale_guard: bool = False) -> li
     ])
     done.append("core hooks")
 
-    # 2026 kit only: baseline schedulers + idle-robot staging goals
+    # 2026 kit only: baseline schedulers + per-cell move delays
     sched = kit / "src" / "TaskScheduler.cpp"
     if (kit / "default_planner" / "scheduler.cpp").exists() and "planCommTimeLimit" in (kit / "src" / "driver.cpp").read_text():
         shutil.copy(EXT / "ext_scheduler.cpp", kit / "default_planner" / "ext_scheduler.cpp")
@@ -76,14 +76,12 @@ def patch(kit: Path, kitty_guard: bool = False, stale_guard: bool = False) -> li
              r"\1\n    if (LorrExtSched::plan(time_limit/2 - DefaultPlanner::SCHEDULER_TIMELIMIT_TOLERANCE, proposed_schedule, env)) return;",
              "scheduler hook"),
         ])
-        patch_file(kit / "src" / "Entry.cpp", [
-            (r"(#include\s+\"Entry.h\")", r"\1\nnamespace LorrExtSched { int idle_goal(int); }", "include"),
-            (r"if\s*\(\s*t_id\s*==\s*-1\s*\)\s*continue\s*;",
-             "if (t_id == -1)\n        {\n            int g = LorrExtSched::idle_goal(i);\n"
-             "            if (g >= 0) env->goal_locations[i].push_back({g, env->curr_timestep});\n"
-             "            continue;\n        }", "idle-goal hook"),
+        patch_file(kit / "src" / "Simulator.cpp", [
+            (r"(#include\s+\"Simulator.h\")", r'\1\n#include "lorr_ext.h"', "include"),
+            (r"(delay_generator\s*->\s*nextTick\s*\(\s*\)\s*;)",
+             r"if (LorrExt::simulate_delay(curr_states, num_of_agents)) return;\n    \1", "delay hook"),
         ])
-        done.append("2026 baseline schedulers")
+        done.append("2026 baseline schedulers + per-cell delays")
 
     if stale_guard:
         # The archived 2024 default entry (kit v2.1.0) keeps a finished task id

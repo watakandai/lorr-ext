@@ -7,33 +7,44 @@ import numpy as np
 import pytest
 
 from lorrext import arrivals
-from lorrext.core import KITS, ROOT, Setting, deadline_metrics, metrics, run, service_intervals, service_stops
+from lorrext import cellmaps
+from lorrext.core import FREE, KITS, ROOT, Setting, deadline_metrics, metrics, run
 from lorrext.replay import load, parse_actions, validate
 
 TP = ROOT / "third_party"
 
 
 # ------------------------------------------------------------------ settings
-def test_service_intervals():
-    assert service_intervals("none") == []
-    assert service_intervals("kitchen") == [[2, 4], [10, 30]]
-    assert service_intervals("3-5;10-20") == [[3, 5], [10, 20]]
-
-
-def test_service_distribution_spec():
-    assert service_stops("lognormal:20:0.5") == [{"dist": "lognormal", "mean": 20.0, "cv": 0.5}]
-    assert service_stops("exponential:3")[0]["cv"] == 1.0
-    assert service_stops("2-4;gamma:20:0.5:1:120")[1] == {"dist": "gamma", "mean": 20.0, "cv": 0.5, "min": 1.0, "max": 120.0}
+def test_parse_dist():
+    assert cellmaps.parse_dist("2-4") == {"dist": "uniform", "lo": 2, "hi": 4}
+    assert cellmaps.parse_dist("lognormal:20:0.5") == {"dist": "lognormal", "mean": 20.0, "cv": 0.5}
+    assert cellmaps.parse_dist("gamma:20:0.5:1:120") == {"dist": "gamma", "mean": 20.0, "cv": 0.5, "min": 1.0, "max": 120.0}
+    assert cellmaps.parse_dist("exponential:3")["cv"] == 1.0
     with pytest.raises(ValueError):
-        service_stops("weibull:3")
+        cellmaps.parse_dist("weibull:3")
+
+
+def test_cell_maps():
+    k = cellmaps.build("kitchen", "service", FREE)
+    covered = {tuple(c) for g in k["cells"] for c in g["cells"]}
+    assert len(covered) == FREE.sum()  # every free cell belongs to one zone
+    assert cellmaps.build("none", "service", FREE) is None
+    d = cellmaps.build("all:0.02:gamma:3:0.5", "delay", FREE)
+    assert d["default"]["p"] == 0.02 and d["default"]["dist"] == "gamma"
+    grid = cellmaps.per_cell(cellmaps.build("congestion", "delay", FREE), FREE, "p")
+    assert np.nanmax(grid) == 0.05 and np.nanmin(grid) == 0.002
 
 
 @pytest.mark.parametrize("spec", ["lognormal:20:0.5", "gamma:20:0.5", "exponential:20", "normal:20:0.3", "2-4"])
 def test_service_sampler_mean(spec):
-    stop = service_stops(spec)[0]
+    stop = cellmaps.parse_dist(spec)
     x = arrivals.service_samples(stop, n=100_000, seed=1)
-    target = (stop["lo"] + stop["hi"]) / 2 if stop["dist"] == "uniform" else stop["mean"]
-    assert abs(x.mean() - target) < 0.05 * target + 0.1
+    assert abs(x.mean() - cellmaps.dist_mean(stop)) < 0.05 * cellmaps.dist_mean(stop) + 0.1
+
+
+def test_2024_kit_rejects_delays(tmp_path):
+    with pytest.raises(ValueError):
+        run("nms2024", Setting(delay="kit_like"), tmp_path)
 
 
 def test_default_arrival_is_pool():
@@ -44,7 +55,8 @@ def test_setting_key_only_shows_non_defaults():
     assert Setting(arrival="mmpp", rate=0.3).key() == "mmpp_r0.3_none_d0_s0_T1000"
     assert Setting(arrival="mmpp", rate=0.3, burst_factor=6).key().endswith("_burst_factor6")
     assert Setting(arrival="pool").key().startswith("pool1.5_")
-    assert ";" not in Setting(service="2-4;10-30").key()
+    assert ":" not in Setting(service="all:lognormal:20:0.5").key()
+    assert Setting(delay="congestion").key().endswith("_delay-congestion")
 
 
 # ------------------------------------------------------------------ arrivals
@@ -111,7 +123,7 @@ needs_kit = pytest.mark.skipif(not (KITS / "lorr2026" / "build" / "lifelong").ex
 
 @needs_kit
 def test_simulation_end_to_end(tmp_path):
-    s = Setting(arrival="poisson", rate=0.4, service="kitchen", steps=300, seed=3)
+    s = Setting(arrival="poisson", rate=0.4, service="all:10-30", steps=300, seed=3)
     r = run("fifo2026", s, tmp_path, screen=1)
     assert r["returncode"] == 0
     # arrivals follow the configured rate
@@ -120,23 +132,23 @@ def test_simulation_end_to_end(tmp_path):
     v = validate(rp)
     assert v["vertex_conflicts"] == 0 and v["off_map_or_obstacle"] == 0 and v["events_off_cell"] == 0
     # every errand is served for at least the lower end of its interval
-    iv, prev = [(2, 4), (10, 30)], {}
+    prev = {}
     for t, a, tid, seq in sorted(rp.events):
         loc = rp.tasks[tid]["locs"][seq - 1]
         start = prev.get(tid, rp.tasks[tid]["reveal"])
         on = sum(tuple(rp.pos[u, a]) == tuple(loc) for u in range(start + 1, t + 1))
-        assert on >= iv[(seq - 1) % 2][0]
+        assert on >= 10  # every cell needs 10-30 ticks of service
         prev[tid] = t
 
 
 @needs_kit
-def test_service_distribution_end_to_end(tmp_path):
-    """C++ quantiles match the Python sampler, and robots dwell accordingly."""
-    s = Setting(arrival="pool", service="lognormal:20:0.5", steps=300, seed=1)
+def test_service_map_end_to_end(tmp_path):
+    """Dwell at each errand follows the distribution of that errand's cell."""
+    s = Setting(service="all:lognormal:20:0.5", steps=300, seed=1)
     r = run("fifo2026", s, tmp_path, screen=1)
     js = json.loads(Path(r["output"]).read_text())
     q = js["lorrExt"]["service"][0]
-    py = arrivals.service_samples(service_stops(s.service)[0])
+    py = arrivals.service_samples(cellmaps.parse_dist("lognormal:20:0.5"))
     assert abs(q["q50"] - np.percentile(py, 50)) <= 1 and abs(q["q95"] - np.percentile(py, 95)) <= 2
     rp = load(Path(r["output"]))
     prev, dwell = {}, []
@@ -146,6 +158,22 @@ def test_service_distribution_end_to_end(tmp_path):
         dwell.append(sum(tuple(rp.pos[u, a]) == tuple(loc) for u in range(start + 1, t + 1)))
         prev[tid] = t
     assert len(dwell) > 50 and abs(np.median(dwell) - q["q50"]) <= 3
+
+
+@needs_kit
+def test_delay_map_end_to_end(tmp_path):
+    """Delays happen at the configured rate, length and place, and robots stand still."""
+    s = Setting(delay="congestion", steps=400, seed=2)
+    r = run("fifo2026", s, tmp_path, screen=1)
+    js = json.loads(Path(r["output"]).read_text())
+    ev = np.array(js["lorrExt"]["delayEvents"]).reshape(-1, 3)
+    assert len(ev) > 50
+    rp = load(Path(r["output"]))
+    deg = cellmaps.free_degree(FREE)
+    on_narrow = np.mean([deg[tuple(rp.pos[t, a])] <= 2 for a, t, L in ev])
+    assert on_narrow > 0.5  # narrow cells are ~22% of the map but carry most delays
+    still = [all((rp.pos[u, a] == rp.pos[t, a]).all() for u in range(t, min(t + L, rp.T) + 1)) for a, t, L in ev]
+    assert np.mean(still) == 1.0
 
 
 @needs_kit

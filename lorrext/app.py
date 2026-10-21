@@ -21,7 +21,8 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lorrext import analyze, arrivals  # noqa: E402
-from lorrext.core import ROOT, SERVICE_PRESETS, SOLVERS, Setting, service_stops  # noqa: E402
+from lorrext import cellmaps  # noqa: E402
+from lorrext.core import FREE, ROOT, SOLVERS, Setting  # noqa: E402
 
 RUNS = ROOT / "runs"
 st.set_page_config(page_title="LoRR-Ext workbench", layout="wide")
@@ -39,6 +40,9 @@ def load_rows() -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
+    df = df[df.solver.isin(list(SOLVERS))]  # drop retired baselines from older runs
+    if df.empty:
+        return df
     df["ok"] = (df["returncode"] == 0) & df.get("throughput", pd.Series(dtype=float)).notna()
     df["scenario"] = df.apply(analyze.scenario, axis=1)
     df["label"] = df["solver"].map(lambda s: SOLVERS.get(s, {}).get("label", s))
@@ -141,17 +145,25 @@ with tab_new:
             s0.decay = st.slider("excitation decay per tick", 0.005, 0.5, 0.05, 0.005)
         rates = st.multiselect("arrival rates (tasks/tick)", [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0, 1.2],
                                default=[0.1, 0.3, 0.5]) if arrival != "pool" else [0.0]
-        preset = st.selectbox("service time per errand", list(SERVICE_PRESETS) + ["custom"],
-                              help="how long a robot must stay on an errand cell; errand j of a task uses slot j mod n")
-        service = st.text_input("custom spec: `lo-hi` or `dist:mean[:cv[:min[:max]]]`, slots separated by `;` "
-                                "(dist = uniform, fixed, exponential, lognormal, gamma, normal)",
-                                "lognormal:3:0.3;gamma:20:0.5") if preset == "custom" else preset
-        try:
-            stops = service_stops(service)
-        except Exception as e:  # noqa: BLE001
-            st.error(f"bad service spec: {e}")
-            stops = []
-        p_delay = st.slider("move-delay probability (2026 kit only)", 0.0, 0.2, 0.0, 0.01)
+        def map_picker(kind, presets, example):
+            choice = st.selectbox(f"{kind} map", ["none"] + presets + ["same everywhere", "custom .json"],
+                                  help=("how long work takes at each cell (from past data)" if kind == "service" else
+                                        "how likely a robot on each cell is to get stuck, and for how long (2026 kit only)"))
+            if choice == "same everywhere":
+                return "all:" + st.text_input(f"{kind}: {'p:' if kind == 'delay' else ''}dist (e.g. `{example}`)", example)
+            if choice == "custom .json":
+                return st.text_input(f"path to {kind} map JSON (format in lorrext/cellmaps.py)", "maps/my_site.json")
+            return choice
+
+        service = map_picker("service", list(cellmaps.SERVICE_PRESETS), "lognormal:20:0.5")
+        delay = map_picker("delay", list(cellmaps.DELAY_PRESETS), "0.02:gamma:3:0.5")
+        maps = {}
+        for kind, spec in (("service", service), ("delay", delay)):
+            try:
+                maps[kind] = cellmaps.build(spec, kind, FREE)
+            except Exception as e:  # noqa: BLE001
+                st.error(f"bad {kind} spec: {e}")
+                maps[kind] = None
         seeds = st.number_input("seeds", 1, 10, 1)
         steps = st.number_input("ticks per run", 200, 5000, 1000, 100)
         deadline = st.number_input("deadline (ticks)", 50, 2000, 300, 50)
@@ -160,8 +172,8 @@ with tab_new:
         st.markdown("**Methods**")
         chosen = [k for k, v_ in SOLVERS.items()
                   if st.checkbox(f"{v_['label']}  ·  {v_['gen']} kit", value=k in ("default2026", "fifo2026", "nms2024"), key=f"m_{k}")]
-        if p_delay > 0 and any(SOLVERS[c]["gen"] == "2024" for c in chosen):
-            st.warning("The 2024 kit has no move-delay model; 2024 entries will run without delays.")
+        if delay != "none" and any(SOLVERS[c]["gen"] == "2024" for c in chosen):
+            st.warning("The 2024 kit has no move-delay model: 2024 entries can't run with a delay map.")
         if any(SOLVERS[c]["gen"] == "2024" for c in chosen) and any(SOLVERS[c]["gen"] == "2026" for c in chosen):
             st.warning("Mixing kits: the 2026 kit runs in real time (30 ms ticks, 300 ms planning window) and the 2024 kit "
                        "gives 100 ms per tick. Its own default loses about half its throughput to the kit, so compare within a kit.")
@@ -169,14 +181,14 @@ with tab_new:
         est = sum((steps * 0.035 + 8) if SOLVERS[c]["gen"] == "2026" else (steps * 0.07 + 10) for c in chosen) * len(rates) * seeds
         st.metric("runs", n)
         st.metric("estimated time with 5 workers", f"{est / 5 / 60:.0f} min")
-        if stops:
-            fig, ax = plt.subplots(figsize=(6, 2.2))
-            for j, stop in enumerate(stops):
-                x = arrivals.service_samples(stop)
-                ax.hist(x, bins=np.arange(x.min(), x.max() + 2) - 0.5, alpha=0.6, density=True,
-                        label=f"slot {j}: {stop['dist']} (mean {x.mean():.1f}, p95 {np.percentile(x, 95):.0f})")
-            ax.set_xlabel("service time (ticks)"); ax.set_ylabel("probability"); ax.legend(fontsize=7)
-            ax.set_title("service-time distributions (what the robot must wait at each errand)", fontsize=9)
+        if maps.get("service") or maps.get("delay"):
+            fig, axes = plt.subplots(1, 2, figsize=(7, 3.2))
+            for ax, kind, field, title in ((axes[0], "service", "mean", "expected service (ticks)"),
+                                           (axes[1], "delay", "p", "delay chance per tick")):
+                grid = cellmaps.per_cell(maps.get(kind), FREE, field)
+                im = ax.imshow(np.where(FREE, grid, np.nan), cmap="viridis", interpolation="nearest")
+                ax.set_title(title, fontsize=8); ax.set_xticks([]); ax.set_yticks([])
+                fig.colorbar(im, ax=ax, fraction=0.046)
             st.pyplot(fig, width="stretch")
         if arrival != "pool":
             s_prev = Setting(**{**asdict(s0), "rate": max(rates) if rates else 0.3, "steps": steps})
@@ -189,7 +201,7 @@ with tab_new:
             st.json(arrivals.burst_stats(x))
         if st.button("Launch sweep", type="primary", disabled=n == 0):
             spec = {"name": name, "solvers": chosen, "rates": rates, "seeds": int(seeds),
-                    "setting": {**asdict(s0), "service": service, "p_delay": p_delay, "steps": int(steps),
+                    "setting": {**asdict(s0), "service": service, "delay": delay, "steps": int(steps),
                                 "deadline": int(deadline)}, "screen": 1 if replay_logs else 3}
             out = RUNS / name
             out.mkdir(parents=True, exist_ok=True)

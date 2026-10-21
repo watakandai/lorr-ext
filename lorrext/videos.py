@@ -17,8 +17,7 @@ PAIRS = [
     ("2_winner_vs_runnerup", "nms2024", "kitty2024", Setting(arrival="poisson", rate=0.7, steps=1000)),
     ("3_lowload_winner_vs_runnerup", "nms2024", "kitty2024", Setting(arrival="poisson", rate=0.05, steps=1000)),
     ("4_lowload_2024_default_vs_winner", "default2024", "nms2024", Setting(arrival="poisson", rate=0.1, steps=1000)),
-    ("5_staging_on_vs_next_to_errand", "stage2026", "stagenear2026", Setting(arrival="poisson", rate=0.1, steps=1000)),
-    ("6_kitchen_service_times", "default2026", "fifo2026", Setting(arrival="poisson", rate=0.2, service="kitchen", steps=1000)),
+    ("5_kitchen_service_times", "default2026", "fifo2026", Setting(arrival="poisson", rate=0.2, service="kitchen", steps=1000)),
 ]
 
 

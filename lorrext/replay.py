@@ -37,6 +37,7 @@ class Replay:
     assign: np.ndarray           # (T+1, A) task id or -1
     label: str = ""
     finished: int = 0
+    ori: np.ndarray | None = None  # (T+1, A) heading 0=E 1=S 2=W 3=N
 
 
 def parse_actions(path, T: int) -> list[str]:
@@ -72,10 +73,12 @@ def load(out_json: Path, map_file: Path | None = None, label: str = "") -> Repla
     rows, cols = obst.shape
     A = js["teamSize"]
     pos = np.zeros((T + 1, A, 2), dtype=np.int16)
+    ori = np.zeros((T + 1, A), dtype=np.int8)
     for a in range(A):
         r, c, o = js["start"][a]
         o = ORI[o] if isinstance(o, str) else int(o)
         pos[0, a] = (r, c)
+        ori[0, a] = o
         for t, act in enumerate(parse_actions(js["actualPaths"][a], T)):
             if act == "F":
                 r, c = r + DR[o], c + DC[o]
@@ -84,6 +87,7 @@ def load(out_json: Path, map_file: Path | None = None, label: str = "") -> Repla
             elif act == "C":
                 o = (o + 3) % 4
             pos[t + 1, a] = (r, c)
+            ori[t + 1, a] = o
     tasks = {}
     for tid, rev, locs in js["tasks"]:
         tasks[tid] = dict(reveal=rev, done=-1, locs=list(zip(locs[0::2], locs[1::2])), agent=-1)
@@ -106,7 +110,7 @@ def load(out_json: Path, map_file: Path | None = None, label: str = "") -> Repla
     for tid, tk in tasks.items():
         if tk["done"] >= 0:
             assign[tk["done"]:][assign[tk["done"]:] == tid] = -1
-    return Replay(rows, cols, obst, pos, T, tasks, events, assign, label, js["numTaskFinished"])
+    return Replay(rows, cols, obst, pos, T, tasks, events, assign, label, js["numTaskFinished"], ori)
 
 
 def validate(rp: Replay) -> dict:

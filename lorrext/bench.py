@@ -33,9 +33,9 @@ def grid(steps: int = 1000) -> dict[str, list[tuple[str, Setting]]]:
     g["kitchen"] = [(sv, Setting(arrival="poisson", rate=r, service="kitchen", seed=sd, steps=steps))
                     for sd in range(2) for r in RATES for sv in SOLVERS]
     g["hawkes"] = [(sv, Setting(arrival="hawkes", rate=r, seed=0, steps=steps)) for r in RATES for sv in SOLVERS]
-    # the 2026 move-delay model exists only in the 2026 kit
-    g["delay"] = [(sv, Setting(arrival=a, rate=r, p_delay=0.05, seed=0, steps=steps))
-                  for a in ("poisson", "mmpp") for r in RATES for sv in SOLVERS_2026]
+    # per-cell move delays exist only in the 2026 kit
+    g["delay"] = [(sv, Setting(arrival="poisson", rate=r, delay=d, seed=0, steps=steps))
+                  for d in ("kit_like", "congestion") for r in RATES for sv in SOLVERS_2026]
     # longer horizon at light load: ~30 scored tasks per 1000-tick run is too few for a 1% criterion
     g["lowload"] = [(sv, Setting(arrival="poisson", rate=r, seed=sd, steps=3 * steps))
                     for sd in range(2) for r in (0.05, 0.1, 0.2) for sv in SOLVERS]
