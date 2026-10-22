@@ -96,13 +96,18 @@ def load(out_json: Path, map_file: Path | None = None, label: str = "") -> Repla
             tasks[t_id]["done"] = rec[2]
     events = [tuple(e) for e in js["events"]]
     assign = np.full((T + 1, A), -1, dtype=np.int32)
+    first_event = {}  # (agent, task) -> first event tick
+    for e in events:
+        first_event.setdefault((e[1], e[2]), e[0])
     for a, sched in enumerate(js.get("actualSchedule", [])):
         cur_t, cur = 0, -1
         for item in str(sched).split(","):
             if ":" not in item:
                 continue
             t, task = (int(x) for x in item.split(":"))
-            t = min(max(t, 0), T)  # first entry carries an uninitialised timestep in the 2026 kit
+            if not 0 <= t <= T:  # the 2026 kit leaves the first entry's timestep uninitialised
+                t = first_event.get((a, task), 0)
+            t = min(max(t, cur_t), T)
             assign[cur_t:t, a] = cur
             cur_t, cur = t, task
         assign[cur_t:, a] = cur

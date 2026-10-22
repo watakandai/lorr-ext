@@ -111,6 +111,29 @@ def write_instance(s: Setting, scheduler: str, out_dir: Path) -> Path:
     return p
 
 
+def run_kit(solver: str, inst: Path, out: Path, steps: int, screen: int = 3, timeout: int = 1800,
+            cpus: str | None = None) -> tuple[int, str]:
+    """Run a kit binary on one instance JSON; returns (returncode, tail of its output)."""
+    sv = SOLVERS[solver]
+    kit = KITS / sv["kit"]
+    cmd = [str(kit / "build" / "lifelong"), "-i", str(inst), "-o", str(out), "-s", str(steps),
+           "-c", str(screen), "-d", "3", "-p", "60000"]
+    if sv["gen"] == "2026":
+        cmd += ["-a", str(TICK_MS), "-t", str(WINDOW_MS), "-n", str(WINDOW_MS), "-x", str(TICK_MS)]
+        if screen <= 2:
+            cmd += ["-w", "100000"]  # keep the whole action log
+    else:
+        cmd += ["-t", str(PLAN_MS)]
+    if cpus:  # pin to dedicated cores (No Man's Sky alone spawns ~10 threads)
+        cmd = ["taskset", "-c", cpus] + cmd
+    try:
+        cp = subprocess.run(cmd, cwd=kit, capture_output=True, text=True, timeout=timeout,
+                            env={**os.environ, "OMP_NUM_THREADS": "1"})
+        return cp.returncode, cp.stdout[-2000:] + cp.stderr[-2000:]
+    except subprocess.TimeoutExpired:
+        return -9, "timeout"
+
+
 def run(solver: str, s: Setting, out_dir: Path, screen: int = 3, timeout: int = 1800, cpus: str | None = None) -> dict:
     """Run one simulation; returns the metrics row (also cached as JSON)."""
     sv = SOLVERS[solver]
@@ -125,24 +148,8 @@ def run(solver: str, s: Setting, out_dir: Path, screen: int = 3, timeout: int = 
     (out_dir / "out").mkdir(parents=True, exist_ok=True)
     inst = write_instance(s, sv["scheduler"], out_dir / "instances")
     out = out_dir / "out" / f"{tag}.json"
-    kit = KITS / sv["kit"]
-    cmd = [str(kit / "build" / "lifelong"), "-i", str(inst), "-o", str(out), "-s", str(s.steps),
-           "-c", str(screen), "-d", "3", "-p", "60000"]
-    if sv["gen"] == "2026":
-        cmd += ["-a", str(TICK_MS), "-t", str(WINDOW_MS), "-n", str(WINDOW_MS), "-x", str(TICK_MS)]
-        if screen <= 2:
-            cmd += ["-w", "100000"]  # keep the whole action log
-    else:
-        cmd += ["-t", str(PLAN_MS)]
-    if cpus:  # pin to dedicated cores (No Man's Sky alone spawns ~10 threads)
-        cmd = ["taskset", "-c", cpus] + cmd
     t0 = time.time()
-    try:
-        cp = subprocess.run(cmd, cwd=kit, capture_output=True, text=True, timeout=timeout,
-                            env={**os.environ, "OMP_NUM_THREADS": "1"})
-        rc, err = cp.returncode, cp.stdout[-2000:] + cp.stderr[-2000:]
-    except subprocess.TimeoutExpired:
-        rc, err = -9, "timeout"
+    rc, err = run_kit(solver, inst, out, s.steps, screen, timeout, cpus)
     row = {"solver": solver, **asdict(s), "cpus": cpus, "returncode": rc, "wall_s": round(time.time() - t0, 1), "output": str(out)}
     if out.exists():
         js = json.loads(out.read_text())

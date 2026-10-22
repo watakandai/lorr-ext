@@ -11,6 +11,7 @@ The same patch applies to the 2026 Start-Kit (v3.1.0) and to archived 2024-seaso
 
 > **New here? Start with the illustrated guide [`docs/explainer.md`](docs/explainer.md)**: problem formulation, environment, each algorithm, and every metric, with figures and code pointers.
 > How the planners move robots, step by step: [`docs/planning.md`](docs/planning.md).
+> Why the solvers differ, in nine small hand-made situations run on the real binaries: [`docs/scenes.md`](docs/scenes.md).
 >
 > Origin: this repo reproduces, checks and corrects a benchmark first built in a claude.ai research chat. [What changed relative to that chat](#what-the-original-chat-got-right-and-wrong) is listed below.
 
@@ -40,6 +41,7 @@ Requirements: Linux, CMake, a C++17 compiler, Boost (program_options, system, fi
 | `lorrext/bench.py` | Benchmark grid (resumable; each run pinned to 2 dedicated cores). |
 | `lorrext/analyze.py` | Capacity, SLA gap, rank correlation, plots → `results/`. |
 | `lorrext/replay.py` | Rebuilds runs tick by tick, validates them, renders comparison videos. |
+| `lorrext/scenes.py` | Small scripted scenes run on every solver and drawn side by side, plus `hunt` for the worst jam in a big run → `docs/scenes/`. |
 | `lorrext/diagnose.py` | Splits each late task's time into unassigned / moving / stuck / dwelling. |
 | `lorrext/app.py` | Streamlit workbench (Runs, New sweep, Replay, Compare & diff, Results). |
 | `results/` | Committed outputs of the grid: tables, plots, videos. |
@@ -65,9 +67,9 @@ Turned on by a `lorrExt` object in the instance JSON:
 }
 ```
 
-* **Arrivals.** The model is one of `pool` (the original kit), `poisson`, `mmpp` or `hawkes`. All models have the same long-run mean `rate`. Arrivals come from a dedicated random stream, so every solver sees identical task arrivals for a given seed (this is tested). Task contents still come from the task file, in order.
+* **Arrivals.** The model is one of `pool` (the original kit), `poisson`, `mmpp` or `hawkes`. All models have the same long-run mean `rate`. A fifth model, `scripted` (`"times": [...]`), reveals task *i* at tick `times[i]` and is used by the scenes. Arrivals come from a dedicated random stream, so every solver sees identical task arrivals for a given seed (this is tested). Task contents still come from the task file, in order.
 * **Service.** An errand at cell *v* uses *v*'s distribution (or `default`; `null` = no work). The realised duration is drawn from a generator seeded by (seed, task, errand), so it doesn't depend on solver behaviour. A robot must accumulate that many ticks on the cell. Being pushed off pauses the clock, and the clock restarts if a different robot takes the errand over. Schedulers can read the known distribution through `LorrExt::service_mean_at(v)` and `LorrExt::service_quantile_at(v, q)`; the realised value stays hidden. Maps are built by `lorrext/cellmaps.py`.
-* **Delays (2026 kit).** Each tick, a robot on cell *v* that isn't already delayed gets stuck with probability `p` of *v*'s group (or `default`), for a length drawn from that group's distribution. With no `delay` block, travel is deterministic. Delay events are written to `lorrExt.delayEvents`.
+* **Delays (2026 kit).** Each tick, a robot on cell *v* that isn't already delayed gets stuck with probability `p` of *v*'s group (or `default`), for a length drawn from that group's distribution. The roll happens again on the tick a delay ends, so a high `p` chains delays; a group with `"trigger": "enter"` rolls only on the tick a robot arrives on the cell (at most one delay per visit). With no `delay` block, travel is deterministic. Delay events are written to `lorrExt.delayEvents`.
 * **Records.** The output JSON gets `lorrExt.tasks = [[id, revealed, completed (-1 = open), agent, n_errands], ...]`.
 * **Metrics** (see the explainer, §4): throughput; latency mean/p50/p99/max; CVaR95; deadline-miss rate and p99 at several deadlines; normalised latency (stretch); mean open tasks; and, across a sweep, deadline-feasible capacity and the SLA gap.
 
@@ -209,6 +211,7 @@ This repo re-implements the benchmark from the chat, since the chat's zip files 
 * The capacity grid is coarse (… 0.5, 0.7, 1.0).
 * Kitty_Knight runs with two guards that change its code. SYSU-LCIS (2024 3rd) wasn't built (it needs CUDA). 2026-season entries aren't archived yet.
 * The 2026 kit runs in real time: heavy background CPU load lowers its results. The benchmark pins runs to dedicated cores for this reason.
+* Open: in the 2026 kit about half the robots are waiting at any moment, in streaks of 10–39 ticks, even in two-robot scenes ([scenes](docs/scenes.md#what-the-scenes-say)). Whether that is the default planner itself or our real-time settings starving it is not yet settled, and it affects every 2026-kit number above.
 
 ## UI
 

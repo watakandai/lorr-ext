@@ -1,0 +1,35 @@
+{
+ "greedy (2026 default) nearest task per robot": {
+  "done": 10,
+  "revealed": 13,
+  "mean_latency": 78.9,
+  "max_wait": 200,
+  "late": 7,
+  "stuck_robot_ticks": 296,
+  "move_share": 0.185,
+  "reassigned_tasks": 0,
+  "last_done": 190
+ },
+ "oldest-first oldest task, nearest robot": {
+  "done": 7,
+  "revealed": 13,
+  "mean_latency": 139.9,
+  "max_wait": 200,
+  "late": 12,
+  "stuck_robot_ticks": 308,
+  "move_share": 0.242,
+  "reassigned_tasks": 0,
+  "last_done": 195
+ },
+ "least-slack most urgent task first": {
+  "done": 7,
+  "revealed": 13,
+  "mean_latency": 138.0,
+  "max_wait": 200,
+  "late": 12,
+  "stuck_robot_ticks": 301,
+  "move_share": 0.243,
+  "reassigned_tasks": 0,
+  "last_done": 189
+ }
+}

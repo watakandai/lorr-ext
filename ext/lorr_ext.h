@@ -119,6 +119,8 @@ struct LorrExtConfig
     //             is chosen so the long-run mean is still `rate`.
     // "hawkes"  : self-exciting; intensity mu + sum alpha*exp(-beta*(t-t_i)),
     //             branching ratio n = alpha/beta, mu = rate*(1-n).
+    // "scripted": task i of the task file is revealed at tick times[i]
+    //             (scenes in lorrext/scenes.py); no tasks after the list ends.
     std::string arrival = "pool";
     double rate = 0.5;
     double burstFactor = 4.0;
@@ -127,6 +129,7 @@ struct LorrExtConfig
     double branching = 0.6;
     double decay = 0.05; // beta
     uint64_t arrivalSeed = 0;
+    std::vector<int> times;          // scripted reveal ticks (sorted)
 
     int mapCols = 0;                 // to turn [row, col] into a cell index
 
@@ -143,8 +146,10 @@ struct LorrExtConfig
     // ---- move delays (per cell, 2026 kit) ---------------------------------
     // Each tick a robot on cell v that is not already delayed gets stuck with
     // probability p(v) for d ~ delay length distribution of v. Cells without an
-    // entry use delayDefault (-1 = never delayed).
-    struct DelayRule { double p = 0; ServiceDist length; };
+    // entry use delayDefault (-1 = never delayed). With "trigger": "enter" a
+    // rule rolls only on the tick a robot arrives on the cell, so a robot is
+    // delayed at most once per visit instead of possibly again and again.
+    struct DelayRule { double p = 0; ServiceDist length; bool onEnter = false; };
     std::vector<DelayRule> delay;
     std::unordered_map<int, int> cell2delay;
     int delayDefault = -1;
@@ -176,6 +181,7 @@ struct LorrExt
         std::vector<std::pair<int, int>> arrivals_per_tick; // (t, n) with n>0
         // per-cell delays
         std::vector<int> remaining_delay;
+        std::vector<int> delay_loc;   // cell at the previous delay roll (-1 = none yet)
         int delay_tick = 0;
         std::vector<std::array<int, 3>> delay_events; // (agent, start tick, length)
     };
@@ -207,6 +213,11 @@ struct LorrExt
             c.branching = get(a, "branching", c.branching);
             c.decay = get(a, "decay", c.decay);
             c.arrivalSeed = get(a, "seed", c.arrivalSeed);
+            if (a.contains("times"))
+            {
+                c.times = a["times"].get<std::vector<int>>();
+                std::sort(c.times.begin(), c.times.end());
+            }
         }
         c.mapCols = get(j, "mapCols", c.mapCols);
         auto parse_dist = [&](const nlohmann::json &o) {
@@ -252,7 +263,8 @@ struct LorrExt
             c.serviceQuantile = get(s, "planQuantile", c.serviceQuantile);
         }
         // "delay": {"default": {"p": 0.01, "dist": "uniform", "lo": 1, "hi": 4} | null,
-        //           "cells": [{"cells": [[r, c], ...], "p": 0.1, "dist": "gamma", "mean": 3, "cv": 0.5}, ...],
+        //           "cells": [{"cells": [[r, c], ...], "p": 0.1, "dist": "gamma", "mean": 3, "cv": 0.5,
+        //                      "trigger": "tick" | "enter"}, ...],
         //           "seed": 0}
         if (j.contains("delay"))
         {
@@ -261,6 +273,7 @@ struct LorrExt
                 LorrExtConfig::DelayRule r;
                 r.p = get(o, "p", 0.0);
                 r.length = parse_dist(o);
+                r.onEnter = get(o, "trigger", std::string("tick")) == "enter";
                 return r;
             };
             if (dl.contains("default") && !dl["default"].is_null())
@@ -347,12 +360,17 @@ struct LorrExt
         auto &s = st();
         if ((int)s.remaining_delay.size() != n)
             s.remaining_delay.assign(n, 0);
+        if ((int)s.delay_loc.size() != n)
+            s.delay_loc.assign(n, -1);
         for (int a = 0; a < n; a++)
         {
             if (s.remaining_delay[a] > 0)
                 s.remaining_delay[a]--;
+            int loc = curr_states[a].location;
+            bool entered = loc != s.delay_loc[a];
+            s.delay_loc[a] = loc;
             if (s.remaining_delay[a] == 0)
-                if (auto *r = delay_rule_at(curr_states[a].location); r && r->p > 0)
+                if (auto *r = delay_rule_at(loc); r && r->p > 0 && (entered || !r->onEnter))
                 {
                     std::mt19937_64 g(mix(c.delaySeed * 0x9E3779B97F4A7C15ULL ^ (uint64_t(a) << 32) ^ uint64_t(s.delay_tick)));
                     if (std::uniform_real_distribution<double>(0, 1)(g) < r->p)
@@ -373,6 +391,9 @@ struct LorrExt
     {
         auto &c = cfg();
         auto &s = st();
+        if (c.arrival == "scripted")
+            return int(std::upper_bound(c.times.begin(), c.times.end(), t) -
+                       std::lower_bound(c.times.begin(), c.times.end(), t));
         double lambda = c.rate;
         if (c.arrival == "mmpp")
         {
@@ -494,6 +515,8 @@ struct LorrExt
         {
             auto o = dist_json(r.length);
             o["p"] = r.p;
+            if (r.onEnter)
+                o["trigger"] = "enter";
             dl.push_back(o);
         }
         ext["delay"] = dl;

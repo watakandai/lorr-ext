@@ -1,0 +1,35 @@
+{
+ "2026 default (guided PIBT, 11-step plans)": {
+  "done": 2,
+  "revealed": 2,
+  "mean_latency": 20.5,
+  "max_wait": 40,
+  "late": 0,
+  "stuck_robot_ticks": 17,
+  "move_share": 0.193,
+  "reassigned_tasks": 0,
+  "last_done": 40
+ },
+ "2024 default (guided PIBT, 1 step)": {
+  "done": 2,
+  "revealed": 2,
+  "mean_latency": 11.0,
+  "max_wait": 21,
+  "late": 0,
+  "stuck_robot_ticks": 0,
+  "move_share": 0.371,
+  "reassigned_tasks": 0,
+  "last_done": 21
+ },
+ "No Man's Sky (PIBT over 5-step moves + annealing)": {
+  "done": 2,
+  "revealed": 2,
+  "mean_latency": 12.5,
+  "max_wait": 22,
+  "late": 0,
+  "stuck_robot_ticks": 1,
+  "move_share": 0.129,
+  "reassigned_tasks": 0,
+  "last_done": 22
+ }
+}

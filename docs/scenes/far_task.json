@@ -1,0 +1,46 @@
+{
+ "greedy (2026 default) nearest task per robot": {
+  "done": 16,
+  "revealed": 101,
+  "mean_latency": 63.4,
+  "max_wait": 193,
+  "late": 0,
+  "stuck_robot_ticks": 331,
+  "move_share": 0.135,
+  "reassigned_tasks": 0,
+  "last_done": 184
+ },
+ "oldest-first oldest task, nearest robot": {
+  "done": 15,
+  "revealed": 101,
+  "mean_latency": 97.8,
+  "max_wait": 171,
+  "late": 0,
+  "stuck_robot_ticks": 273,
+  "move_share": 0.229,
+  "reassigned_tasks": 0,
+  "last_done": 188
+ },
+ "least-slack most urgent task first": {
+  "done": 16,
+  "revealed": 101,
+  "mean_latency": 97.9,
+  "max_wait": 169,
+  "late": 0,
+  "stuck_robot_ticks": 292,
+  "move_share": 0.226,
+  "reassigned_tasks": 0,
+  "last_done": 198
+ },
+ "No Man's Sky (annealing, may re-assign)": {
+  "done": 16,
+  "revealed": 101,
+  "mean_latency": 14.8,
+  "max_wait": 200,
+  "late": 0,
+  "stuck_robot_ticks": 2,
+  "move_share": 0.669,
+  "reassigned_tasks": 6,
+  "last_done": 80
+ }
+}

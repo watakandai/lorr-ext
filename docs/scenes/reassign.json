@@ -1,0 +1,35 @@
+{
+ "2024 default (greedy, commits)": {
+  "done": 2,
+  "revealed": 2,
+  "mean_latency": 21.0,
+  "max_wait": 32,
+  "late": 0,
+  "stuck_robot_ticks": 0,
+  "move_share": 0.508,
+  "reassigned_tasks": 0,
+  "last_done": 32
+ },
+ "No Man's Sky (re-optimises every tick)": {
+  "done": 2,
+  "revealed": 2,
+  "mean_latency": 17.0,
+  "max_wait": 22,
+  "late": 0,
+  "stuck_robot_ticks": 1,
+  "move_share": 0.192,
+  "reassigned_tasks": 1,
+  "last_done": 22
+ },
+ "2026 default (greedy, commits)": {
+  "done": 2,
+  "revealed": 2,
+  "mean_latency": 45.5,
+  "max_wait": 46,
+  "late": 0,
+  "stuck_robot_ticks": 45,
+  "move_share": 0.292,
+  "reassigned_tasks": 0,
+  "last_done": 46
+ }
+}
