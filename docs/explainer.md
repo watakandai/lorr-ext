@@ -245,6 +245,8 @@ Same situation, three rules, three different tasks left waiting. "path" is the t
 
 ### 3.2 Planners: PIBT, the common core
 
+> For a deeper, illustrated walk through every planner (PIBT, traffic guidance, the 2026 executor, No Man's Sky, WPPL, SIPP, LNS, LaCAM), see [`planning.md`](planning.md).
+
 ![pibt](figures/09_pibt.png)
 
 **PIBT (Priority Inheritance with Backtracking)**, one tick:

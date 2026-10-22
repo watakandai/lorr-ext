@@ -10,6 +10,7 @@ LoRR-Ext is a testbed that asks **how much of a solver's leaderboard throughput 
 The same patch applies to the 2026 Start-Kit (v3.1.0) and to archived 2024-season entries. When the new settings are absent, every kit behaves exactly as released.
 
 > **New here? Start with the illustrated guide [`docs/explainer.md`](docs/explainer.md)**: problem formulation, environment, each algorithm, and every metric, with figures and code pointers.
+> How the planners move robots, step by step: [`docs/planning.md`](docs/planning.md).
 >
 > Origin: this repo reproduces, checks and corrects a benchmark first built in a claude.ai research chat. [What changed relative to that chat](#what-the-original-chat-got-right-and-wrong) is listed below.
 
