@@ -18,6 +18,7 @@ from pathlib import Path
 
 EXT = Path(__file__).resolve().parent.parent / "ext"
 MARK = "LORR_EXT_PATCHED"
+FAULTS_MARK = "LORR_EXT_FAULTS"  # later hook set: applied on its own so built kits can be upgraded in place
 
 
 def sub_once(text: str, pattern: str, repl, path: Path, what: str) -> str:
@@ -27,16 +28,16 @@ def sub_once(text: str, pattern: str, repl, path: Path, what: str) -> str:
     return new
 
 
-def patch_file(path: Path, edits) -> None:
+def patch_file(path: Path, edits, mark: str = MARK) -> None:
     text = path.read_text()
-    if MARK in text:
+    if mark in text:
         return
     for pattern, repl, what in edits:
         text = sub_once(text, pattern, repl, path, what)
-    path.write_text(f"// {MARK}\n" + text)
+    path.write_text(f"// {mark}\n" + text)
 
 
-def patch(kit: Path, kitty_guard: bool = False, stale_guard: bool = False) -> list[str]:
+def patch(kit: Path, kitty_guard: bool = False, stale_guard: bool = False, nms_arrival_fix: bool = False) -> list[str]:
     done = []
     shutil.copy(EXT / "lorr_ext.h", kit / "inc" / "lorr_ext.h")
 
@@ -82,6 +83,18 @@ def patch(kit: Path, kitty_guard: bool = False, stale_guard: bool = False) -> li
              r"if (LorrExt::simulate_delay(curr_states, num_of_agents)) return;\n    \1", "delay hook"),
         ])
         done.append("2026 baseline schedulers + per-cell delays")
+        patch_file(kit / "src" / "Simulator.cpp", [
+            (r"(\n(\s*)auto\s+pre_states\s*=\s*curr_states\s*;)",
+             r"\n\2LorrExt::filter_actions(curr_states, actions, timestep);\1", "faults hook"),
+        ], FAULTS_MARK)
+    else:
+        # 2024 kits: faults hook just before the joint action is validated
+        patch_file(kit / "src" / "Simulator.cpp", [
+            (r"(#include\s+\"Simulator.h\")", r'\1\n#include "lorr_ext.h"', "include"),
+            (r"(\n(\s*)if\s*\(\s*!\s*model\s*->\s*is_valid\s*\(\s*curr_states\s*,\s*actions\s*,\s*timestep\s*\)\s*\))",
+             r"\n\2LorrExt::filter_actions(curr_states, actions, timestep);\1", "faults hook"),
+        ], FAULTS_MARK)
+    done.append("robot faults hook")
 
     if stale_guard:
         # The archived 2024 default entry (kit v2.1.0) keeps a finished task id
@@ -134,6 +147,16 @@ def patch(kit: Path, kitty_guard: bool = False, stale_guard: bool = False) -> li
                 p.write_text(f"// {MARK}\n" + text)
                 n += k
         done.append(f"kitty guard ({n} sites)")
+    if nms_arrival_fix:
+        # No Man's Sky scores the LAST step a 5-tick macro spends on the target, as -d (later is
+        # better), so a robot next to its goal loops to arrive at the horizon's end and never
+        # arrives (docs/research/E2_nms_livelock.md). Score the first arrival, earlier = better.
+        patch_file(kit / "Solution" / "Planner" / "PIBT" / "pibts.cpp", [
+            (r"if\s*\(\s*get_graph\(\)\.get_pos\(path\[d\]\)\.get_pos\(\)\s*==\s*target\s*\)\s*\{\s*dist\s*=\s*d\s*;\s*dist\s*=\s*-dist\s*;\s*\}",
+             "if (get_graph().get_pos(path[d]).get_pos() == target) {\n            dist = -static_cast<int64_t>(DEPTH - d); /* LoRR-Ext arrival fix */\n            break;\n        }",
+             "nms arrival fix"),
+        ], "LORR_EXT_NMS_ARRIVAL_FIX")
+        done.append("nms arrival fix")
     return done
 
 
@@ -142,8 +165,9 @@ def main() -> None:
     ap.add_argument("kit", type=Path)
     ap.add_argument("--kitty-guard", action="store_true")
     ap.add_argument("--stale-task-guard", action="store_true")
+    ap.add_argument("--nms-arrival-fix", action="store_true")
     a = ap.parse_args()
-    print("patched:", ", ".join(patch(a.kit, a.kitty_guard, a.stale_task_guard)))
+    print("patched:", ", ".join(patch(a.kit, a.kitty_guard, a.stale_task_guard, a.nms_arrival_fix)))
 
 
 if __name__ == "__main__":

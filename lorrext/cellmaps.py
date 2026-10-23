@@ -12,6 +12,9 @@ Specs accepted by Setting.service / Setting.delay:
     "all:<dist>"                        same distribution on every cell, e.g.
                                         service "all:lognormal:20:0.5",
                                         delay   "all:0.02:gamma:3:0.5" (p, then dist)
+    "char:<C>:<dist>"                   service on every cell marked C in the map file,
+                                        e.g. "char:E:normal:8:0.3" = picking time at the
+                                        stations of a warehouse map (needs the map's chars)
     path/to/map.json                    explicit map in the instance format:
         {"default": {...} | null,
          "cells": [{"name": "onions", "cells": [[10, 12], ...],
@@ -105,10 +108,25 @@ SERVICE_PRESETS = {"kitchen": _kitchen, "stations": _stations}
 DELAY_PRESETS = {"kit_like": _kit_like, "congestion": _congestion}
 
 
-def build(spec: str, kind: str, free: np.ndarray, seed: int = 0) -> dict | None:
+def read_chars(map_file: Path) -> np.ndarray:
+    lines = Path(map_file).read_text().splitlines()
+    h, w = int(lines[1].split()[1]), int(lines[2].split()[1])
+    return np.array([list(row[:w]) for row in lines[4:4 + h]])
+
+
+def build(spec: str, kind: str, free: np.ndarray, seed: int = 0, chars: np.ndarray | None = None) -> dict | None:
     """Spec -> map dict in the instance format (None = feature off)."""
     if spec in ("", "none"):
         return None
+    if spec.startswith("char:"):
+        _, ch, dist = spec.split(":", 2)
+        if chars is None:
+            raise ValueError(f"{spec!r} needs the map's characters")
+        cells = [[int(r), int(c)] for r, c in np.argwhere(chars == ch)]
+        if kind == "delay":
+            p, dist = dist.split(":", 1)
+            return {"default": None, "cells": [{"name": f"cells {ch}", "cells": cells, "p": float(p), **parse_dist(dist)}]}
+        return {"default": None, "cells": [{"name": f"cells {ch}", "cells": cells, **parse_dist(dist)}]}
     presets = SERVICE_PRESETS if kind == "service" else DELAY_PRESETS
     if spec in presets:
         return presets[spec](free, seed)

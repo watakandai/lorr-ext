@@ -24,13 +24,16 @@ if [ ! -d "$TP/Code-Archive" ]; then
 fi
 if [ ! -d "$TP/Benchmark-Archive" ]; then
   git clone -q --depth 1 --filter=blob:none --sparse https://github.com/MAPF-Competition/Benchmark-Archive.git "$TP/Benchmark-Archive"
-  git -C "$TP/Benchmark-Archive" sparse-checkout set "$A24/Main Round Evaluation Instances/random.domain"
+  git -C "$TP/Benchmark-Archive" sparse-checkout set "$A24/Main Round Evaluation Instances/random.domain" \
+    "$A24/Problem Generator/script"
 fi
+# research layouts (lorrext/instances.py) read warehouse_small.map / sortation_small.map from here
+git -C "$TP/Benchmark-Archive" sparse-checkout add "$A24/Problem Generator/script" 2>/dev/null || true
 
 # benchmark instance: 2024 main-round RANDOM-01 map/agents/tasks (100 robots)
 R="$TP/Benchmark-Archive/$A24/Main Round Evaluation Instances/random.domain"
 cp "$R/maps/random-32-32-20.map" instances/base/maps/
-cp "$R/agents/random_32_32_20_100.agents" instances/base/agents/
+cp "$R/agents/random_32_32_20_100.agents" "$R/agents/random_32_32_20_200.agents" "$R/agents/random_32_32_20_400.agents" instances/base/agents/
 cp "$R/tasks/random_32_32_20.tasks" instances/base/tasks/random_32_32_20_official.tasks
 
 declare -A SRC=(
@@ -38,8 +41,9 @@ declare -A SRC=(
   [nms2024]="$TP/Code-Archive/$A24/Team_No_Man's_Sky/$NMS"
   [kitty2024]="$TP/Code-Archive/$A24/Team_Kitty_Knight/$KITTY"
   [default2024]="$TP/Code-Archive/$A24/Team_Default_Entry/$DEF24"
+  [nms2024fix]="$TP/Code-Archive/$A24/Team_No_Man's_Sky/$NMS"   # research variant (docs/research)
 )
-declare -A FLAGS=([kitty2024]="--kitty-guard")
+declare -A FLAGS=([kitty2024]="--kitty-guard" [nms2024fix]="--nms-arrival-fix")
 
 build() {
   local k=$1
@@ -51,5 +55,5 @@ build() {
      && echo "built $k" || { echo "FAILED $k (see kits/$k/build.log)"; return 1; }
 }
 
-for k in ${KITS:-lorr2026 nms2024 kitty2024 default2024}; do build "$k" & done
+for k in ${KITS:-lorr2026 nms2024 kitty2024 default2024 nms2024fix}; do build "$k" & done
 wait
