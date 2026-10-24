@@ -41,9 +41,11 @@ declare -A SRC=(
   [nms2024]="$TP/Code-Archive/$A24/Team_No_Man's_Sky/$NMS"
   [kitty2024]="$TP/Code-Archive/$A24/Team_Kitty_Knight/$KITTY"
   [default2024]="$TP/Code-Archive/$A24/Team_Default_Entry/$DEF24"
-  [nms2024fix]="$TP/Code-Archive/$A24/Team_No_Man's_Sky/$NMS"   # research variant (docs/research)
+  [nms2024fix]="$TP/Code-Archive/$A24/Team_No_Man's_Sky/$NMS"   # research variants (docs/research)
+  [lorr2026nx]="$TP/Start-Kit"
+  [lorr2026g]="$TP/Start-Kit"
 )
-declare -A FLAGS=([kitty2024]="--kitty-guard" [nms2024fix]="--nms-arrival-fix")
+declare -A FLAGS=([kitty2024]="--kitty-guard" [nms2024fix]="--nms-arrival-fix" [lorr2026nx]="--plan-ahead" [lorr2026g]="--plan-ahead --pibt-reserve 20")
 
 build() {
   local k=$1
@@ -55,5 +57,5 @@ build() {
      && echo "built $k" || { echo "FAILED $k (see kits/$k/build.log)"; return 1; }
 }
 
-for k in ${KITS:-lorr2026 nms2024 kitty2024 default2024 nms2024fix}; do build "$k" & done
+for k in ${KITS:-lorr2026 nms2024 kitty2024 default2024 nms2024fix lorr2026nx lorr2026g}; do build "$k" & done
 wait

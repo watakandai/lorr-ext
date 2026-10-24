@@ -37,7 +37,59 @@ def patch_file(path: Path, edits, mark: str = MARK) -> None:
     path.write_text(f"// {mark}\n" + text)
 
 
-def patch(kit: Path, kitty_guard: bool = False, stale_guard: bool = False, nms_arrival_fix: bool = False) -> list[str]:
+PLAN_AHEAD_HELPERS = r"""
+#include "lorr_ext.h"
+namespace DefaultPlanner {
+    // LoRR-Ext plan-ahead (docs/research/E1_2026_execution.md): inside the multi-step
+    // rollout, a robot that reaches its goal moves on to its task's next errand (after the
+    // known 95th-percentile service time, if the cell has one) instead of waiting for the
+    // next planning episode. Its guide path still ends at the old goal, so it uses the plain
+    // distance heuristic to the new one.
+    std::vector<char> lorrext_plain_h;
+    static std::vector<int> lorrext_errand, lorrext_hold;
+    static void lorrext_begin_rollout(SharedEnvironment* env)
+    {
+        lorrext_plain_h.assign(env->num_of_agents, 0);
+        lorrext_errand.assign(env->num_of_agents, -1);
+        lorrext_hold.assign(env->num_of_agents, -1);
+        for (int i = 0; i < env->num_of_agents; i++)
+        {
+            int t = env->curr_task_schedule[i];
+            if (t != -1 && env->task_pool.count(t))
+                lorrext_errand[i] = env->task_pool[t].idx_next_loc;
+        }
+    }
+    static void lorrext_advance_goals(SharedEnvironment* env, TrajLNS& lns)
+    {
+        for (int i = 0; i < env->num_of_agents; i++)
+        {
+            int t = env->curr_task_schedule[i];
+            if (lorrext_errand[i] < 0 || env->goal_locations[i].empty() || !env->task_pool.count(t))
+                continue;
+            int g = env->goal_locations[i].front().first;
+            if (env->start_states[i].location != g)
+                continue;
+            if (lorrext_hold[i] < 0)
+                lorrext_hold[i] = LorrExt::service_quantile_at(g, 0.95);
+            if (lorrext_hold[i] > 0) { lorrext_hold[i]--; continue; }
+            const auto& task = env->task_pool[t];
+            if (lorrext_errand[i] + 1 >= (int)task.locations.size())
+                continue;
+            int ng = task.locations[++lorrext_errand[i]];
+            env->goal_locations[i].clear();
+            env->goal_locations[i].push_back({ng, task.t_revealed});
+            if (lns.heuristics[ng].empty())
+                init_heuristic(lns.heuristics[ng], env, ng);
+            lorrext_plain_h[i] = 1;
+            lorrext_hold[i] = -1;
+        }
+    }
+}
+"""
+
+
+def patch(kit: Path, kitty_guard: bool = False, stale_guard: bool = False, nms_arrival_fix: bool = False,
+          plan_ahead: bool = False, pibt_reserve: int | None = None) -> list[str]:
     done = []
     shutil.copy(EXT / "lorr_ext.h", kit / "inc" / "lorr_ext.h")
 
@@ -157,6 +209,29 @@ def patch(kit: Path, kitty_guard: bool = False, stale_guard: bool = False, nms_a
              "nms arrival fix"),
         ], "LORR_EXT_NMS_ARRIVAL_FIX")
         done.append("nms arrival fix")
+    if plan_ahead:
+        dp = kit / "default_planner"
+        patch_file(dp / "planner.cpp", [
+            (r'(#include\s+"const.h"\s*\n)', lambda m: m.group(1) + PLAN_AHEAD_HELPERS, "helpers"),
+            (r"(const\s+std::vector<DCR>\s+original_decided\s*=\s*decided\s*;)",
+             r"\1\n        const auto lorrext_original_goals = env->goal_locations;\n        lorrext_begin_rollout(env);", "begin"),
+            (r"(append_actions_and_rollout_states\(env,\s*actions,\s*one_step_actions\)\s*;)",
+             r"\1\n            lorrext_advance_goals(env, trajLNS);", "advance"),
+            (r"(\n(\s*)decided\s*=\s*original_decided\s*;)",
+             r"\1\n\2env->goal_locations = lorrext_original_goals;\n\2lorrext_plain_h.assign(env->num_of_agents, 0);", "restore"),
+        ], "LORR_EXT_PLAN_AHEAD")
+        patch_file(dp / "pibt.cpp", [
+            (r"(int\s+get_gp_h\s*\(\s*TrajLNS&\s*lns\s*,\s*int\s+ai\s*,\s*int\s+target\s*\)\s*\{)",
+             r"extern std::vector<char> lorrext_plain_h;\n\1\n    if (ai < (int)lorrext_plain_h.size() && lorrext_plain_h[ai] && !lns.heuristics[lns.tasks.at(ai)].empty())\n        return get_heuristic(lns.heuristics[lns.tasks.at(ai)], lns.env, target, &(lns.neighbors));", "plain heuristic"),
+        ], "LORR_EXT_PLAN_AHEAD")
+        done.append("plan-ahead")
+    if pibt_reserve is not None:
+        # The 2026 planner reserves MIN_PIBT_TIME ms for PIBT and gives guidance the rest of the
+        # window; 100 ms leaves short windows no guidance at all (docs/research/E1_2026_execution.md).
+        patch_file(kit / "default_planner" / "const.h", [
+            (r"const\s+int\s+MIN_PIBT_TIME\s*=\s*\d+\s*;", f"const int MIN_PIBT_TIME = {pibt_reserve}; /* LoRR-Ext */", "pibt reserve"),
+        ], "LORR_EXT_PIBT_RESERVE")
+        done.append(f"pibt reserve {pibt_reserve} ms")
     return done
 
 
@@ -166,8 +241,11 @@ def main() -> None:
     ap.add_argument("--kitty-guard", action="store_true")
     ap.add_argument("--stale-task-guard", action="store_true")
     ap.add_argument("--nms-arrival-fix", action="store_true")
+    ap.add_argument("--plan-ahead", action="store_true", help="2026 default planner: next errand inside the rollout")
+    ap.add_argument("--pibt-reserve", type=int, default=None, help="2026 default planner: MIN_PIBT_TIME in ms")
     a = ap.parse_args()
-    print("patched:", ", ".join(patch(a.kit, a.kitty_guard, a.stale_task_guard, a.nms_arrival_fix)))
+    print("patched:", ", ".join(patch(a.kit, a.kitty_guard, a.stale_task_guard, a.nms_arrival_fix, a.plan_ahead,
+                                      a.pibt_reserve)))
 
 
 if __name__ == "__main__":

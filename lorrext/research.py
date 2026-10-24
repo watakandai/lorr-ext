@@ -36,7 +36,7 @@ SEEDS = (0, 1)
 def grid() -> dict[str, list[tuple[str, Setting]]]:
     g: dict[str, list[tuple[str, Setting]]] = {}
     layouts = [("random", "official", "none"), ("random_renamed", "official", "none"),
-               ("warehouse", "g2p", "char:E:normal:8:0.3"), ("sortation", "sort", "char:E:uniform:2:4")]
+               ("warehouse", "g2p", "char:E:normal:8:0.3"), ("sortation", "sort", "char:E:2-4")]
     g["C2"] = [(sv, Setting(layout=L, tasks=t, service=svc, agents=n, seed=sd))
                for L, t, svc in layouts for n in (100, 200) for sd in SEEDS for sv in ALL]
     g["C3"] = [(sv, Setting(agents=n, seed=sd, **({"layout": "random"} if n in (100, 200, 400) else {})))
@@ -84,7 +84,11 @@ def run_jobs(jobs, out: Path = OUT, workers: int = 6, cores_per_run: int = 2, lo
         futs = {ex.submit(pinned, sv, s): (sv, s) for sv, s in jobs}
         for i, f in enumerate(as_completed(futs), 1):
             sv, s = futs[f]
-            r = f.result()
+            try:
+                r = f.result()
+            except Exception as e:  # one broken setting must not stop the grid
+                log(f"FAILED {sv} {s.key()}: {e!r}")
+                continue
             rows.append(r)
             el = time.time() - t0
             log(f"[{i}/{len(jobs)} {el / 60:.0f}m eta {el / i * (len(jobs) - i) / 60:.0f}m] {sv:12s} {s.key():60s} "

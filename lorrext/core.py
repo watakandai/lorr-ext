@@ -31,8 +31,11 @@ SOLVERS = {
     "kitty2024": dict(kit="kitty2024", gen="2024", scheduler="default", label="Kitty_Knight (2024 2nd, guarded)"),
     # stage-5 variants (docs/research/proposals.md); not part of the default grids
     "nms2024fix": dict(kit="nms2024fix", gen="2024", scheduler="default", label="No Man's Sky + arrival fix"),
+    "default2026nx": dict(kit="lorr2026nx", gen="2026", scheduler="default", label="2026 default + plan-ahead"),
+    # + 20 ms PIBT reserve; meant to run with a short window (core.WINDOW_MS), see E1
+    "default2026g": dict(kit="lorr2026g", gen="2026", scheduler="default", label="2026 default + plan-ahead + guidance budget"),
 }
-RESEARCH_VARIANTS = {"nms2024fix"}
+RESEARCH_VARIANTS = {"nms2024fix", "default2026nx", "default2026g"}
 
 TICK_MS = 30      # 2026 kit: wall-clock per tick
 WINDOW_MS = 300   # 2026 kit: planner communication window

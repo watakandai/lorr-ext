@@ -22,8 +22,22 @@
 3. **Traffic guidance is not optional.** At a 1-tick window *without* guidance time, throughput collapses to 0.28, below even the 10-tick run. The 2026 kit's budget rule (PIBT first, guidance gets the rest) silently disables guidance whenever the window is short.
 4. **The remaining 0.65 → 0.81 is the execution layer itself.** With 1-tick plans, the differences left are the executor: it drops planned waits, re-orders execution by the temporal plan graph, and rolls PIBT out internally with turns appended as delays. Not isolated further here.
 
+## Fixes tried (stage 5)
+
+Both are patcher options (`tools/patch_kit.py`), built as separate solvers by `scripts/setup.sh`. Competition instance, 30 ms ticks (our real-time setting), one run each.
+
+| Variant | Window | Tasks/tick | p50 latency |
+|---|---|---|---|
+| 2026 default | 10 ticks | 0.444 | 186 |
+| + **plan-ahead** (`--plan-ahead`): inside the rollout a robot that reaches its goal moves on to its task's next errand (after the known q95 service time) | 10 ticks | 0.459 (+3%) | 179 |
+| + plan-ahead + **guidance budget** (`--pibt-reserve 20`: PIBT's reserve cut from 100 to 20 ms) | 10 ticks | 0.449 | 188 |
+| same | 5 ticks | 0.496 | 171 |
+| same | 3 ticks | 0.544 | 158 |
+| same | **2 ticks** | **0.588 (+32%)** | 144 |
+
+- **Plan-ahead is a small gain, so most of the latency is not errand transitions inside a window.** In the 2026 kit a busy robot covers only 2–3 cells per 10-tick window, so it rarely finishes an errand mid-window. The big cost is the window itself: a plan is computed from a predicted state and reaches the robots a full window later.
+- **A shorter window is the real fix, once guidance keeps its time.** PIBT for 100 robots needs about 1 ms per step; the kit's fixed 100 ms reserve is what forbids short windows. With a 20 ms reserve, a 2-tick window at real-time speed recovers 0.44 → 0.59, three quarters of the way to the 1-tick slow-clock result (0.65). Shorter windows cost more planning calls per tick, so the right window is the shortest one whose planning still finishes in time; it scales with fleet size.
+
 ## What it means
 
-The 2026 kit's design is right for imperfect execution (see B1/B2: it is the only one that survives breakdowns), but the default planner pays for it on every goal change. Two fixes follow (see [`proposals.md`](proposals.md)):
-- **Plan the next errand ahead.** The rollout could switch a robot to its next errand when it reaches the current one (the task's errands are known), instead of freezing goals for the window.
-- **Budget guidance explicitly.** Reserve guidance time as a fraction of the window, not "whatever PIBT's 100 ms floor leaves".
+The 2026 kit's design is right for imperfect execution (B1/B2: it is the only one that survives breakdowns), but the default planner, as configured, plans too rarely and with a fixed reserve that wastes the window. The proposal ([`proposals.md`](proposals.md)): size the planning window to the planner's actual cost, reserve PIBT time per robot rather than a flat 100 ms, and let the rollout move robots on to their next errand.
