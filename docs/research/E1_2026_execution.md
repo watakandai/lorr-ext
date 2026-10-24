@@ -40,4 +40,4 @@ Both are patcher options (`tools/patch_kit.py`), built as separate solvers by `s
 
 ## What it means
 
-The 2026 kit's design is right for imperfect execution (B1/B2: it is the only one that survives breakdowns), but the default planner, as configured, plans too rarely and with a fixed reserve that wastes the window. The proposal ([`proposals.md`](proposals.md)): size the planning window to the planner's actual cost, reserve PIBT time per robot rather than a flat 100 ms, and let the rollout move robots on to their next errand.
+The 2026 kit's design is right for imperfect execution (B1/B2: it is the only one that survives breakdowns), but the default planner, as configured, plans too rarely and with a fixed reserve that wastes the window. The proposal ([`results.md`](results.md#fixes-stage-5)): size the planning window to the planner's actual cost, reserve PIBT time per robot rather than a flat 100 ms, and let the rollout move robots on to their next errand.

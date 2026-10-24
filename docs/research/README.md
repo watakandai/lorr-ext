@@ -13,10 +13,10 @@ It builds on the rest of the repo:
 | # | Stage | Output |
 |---|---|---|
 | 1 | Understand the algorithms: design choices, assumptions, pros and cons, and the weaknesses they *predict* | [`algorithms.md`](algorithms.md) |
-| 2 | Benchmark them on the competition setting and on realistic maps, to find weaknesses | [`baseline.md`](baseline.md) |
+| 2 | Benchmark them on the competition setting and on realistic maps, to find weaknesses | [`results.md`](results.md) |
 | 3 | Change the problem (the research questions below), benchmark every solver against each change | one report per question in this folder |
 | 4 | For each weakness, a root-cause hypothesis, and an experiment that confirms or refutes it | the "Why" section of each report |
-| 5 | Proposals to overcome each weakness, prototyped and measured where feasible | the "Fix" section of each report, summarised in [`proposals.md`](proposals.md) |
+| 5 | Proposals to overcome each weakness, prototyped and measured where feasible | the "Fix" section of each report, summarised in [`results.md`](results.md#fixes-stage-5) |
 
 Each report follows the same shape: **question → real-world motivation → how it is modelled → results → why (hypothesis, test, verdict) → fix**. Negative results are reported as such.
 

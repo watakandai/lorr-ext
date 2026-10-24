@@ -60,4 +60,4 @@ for (uint32_t d = 0; d < DEPTH; d++) {
 }
 ```
 
-Built as a separate solver, `nms2024fix` (`tools/patch_kit.py --nms-arrival-fix`, see [`proposals.md`](proposals.md)). It removes the loop in every reproduction and scene, and on the exact competition instance the authors tuned the rule on it *raises* throughput by 6.6% and lowers p99 latency by 8%: robots near their goal stop dawdling. The far task in the scene is still never served (max wait 200): that is a separate weakness, the scheduler's lack of any age term ([A1/A4](README.md)).
+Built as a separate solver, `nms2024fix` (`tools/patch_kit.py --nms-arrival-fix`, see [`results.md`](results.md#fixes-stage-5)). It removes the loop in every reproduction and scene, and on the exact competition instance the authors tuned the rule on it *raises* throughput by 6.6% and lowers p99 latency by 8%: robots near their goal stop dawdling. The far task in the scene is still never served (max wait 200): that is a separate weakness, the scheduler's lack of any age term ([A1/A4](README.md)).
