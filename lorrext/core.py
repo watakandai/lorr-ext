@@ -285,8 +285,9 @@ def bfs_from(src: int) -> dict:
 
 
 def _task_errands(s: "Setting | None") -> list[list[int]]:
+    g = _geometry()  # also initialises the distance cache that task_length uses
     if s is None or (s.layout == "random" and s.tasks == "official"):
-        return _geometry()["tasks"]
+        return g["tasks"]
     key = (s.layout, s.tasks, s.seed)
     if key not in _GEOM.setdefault("variants", {}):
         _GEOM["variants"][key] = instances.task_list(s.layout, s.tasks, s.seed)
