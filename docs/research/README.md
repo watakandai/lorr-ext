@@ -78,7 +78,7 @@ Each question changes one thing about the competition problem. The *prediction* 
 
 | Stage / question | Status |
 |---|---|
-| 1 Algorithms | planned |
-| 2 Baseline | planned |
-| A1–A4, B1–B3, C1–C3 | planned |
+| 1 Algorithms | done ([algorithms.md](algorithms.md)) |
+| 2 Baseline | done ([results.md](results.md)) |
+| A1–A4, B1–B3, C1–C3 | done ([results.md](results.md)); E1, E2 root-caused and fixed |
 | E1, E2 | planned |
