@@ -89,7 +89,7 @@ namespace DefaultPlanner {
 
 
 def patch(kit: Path, kitty_guard: bool = False, stale_guard: bool = False, nms_arrival_fix: bool = False,
-          plan_ahead: bool = False, pibt_reserve: int | None = None) -> list[str]:
+          plan_ahead: bool = False, pibt_reserve: int | None = None, kitty_resync: bool = False) -> list[str]:
     done = []
     shutil.copy(EXT / "lorr_ext.h", kit / "inc" / "lorr_ext.h")
 
@@ -232,6 +232,30 @@ def patch(kit: Path, kitty_guard: bool = False, stale_guard: bool = False, nms_a
             (r"const\s+int\s+MIN_PIBT_TIME\s*=\s*\d+\s*;", f"const int MIN_PIBT_TIME = {pibt_reserve}; /* LoRR-Ext */", "pibt reserve"),
         ], "LORR_EXT_PIBT_RESERVE")
         done.append(f"pibt reserve {pibt_reserve} ms")
+    if kitty_resync:
+        # Kitty_Knight advances its plan only if every robot reached its planned state and
+        # exit(-1)s when some moved and others didn't (any delay or breakdown). Instead: if
+        # nobody moved, retry the step; otherwise drop the plans and restart from the actual
+        # states (LaCAM2 rebuilds the window). docs/research/B1_breakdowns.md
+        patch_file(kit / "wppl_planner" / "src" / "LNS" / "LNSSolver.cpp", [
+            (r"if\s*\(\s*match\s*\)\s*\{\s*\+\+executed_step\s*;\s*\}",
+             """if (match){
+            ++executed_step;
+        } else { /* LoRR-Ext resync */
+            bool stayed = true;
+            for (int i=0;i<execution_paths.size();++i)
+                if (execution_paths[i][executed_step].location!=env.curr_states[i].location || execution_paths[i][executed_step].orientation!=env.curr_states[i].orientation)
+                    stayed = false;
+            if (!stayed) {
+                for (int i=0;i<execution_paths.size();++i) {
+                    execution_paths[i].clear(); execution_paths[i].push_back(env.curr_states[i]);
+                    planning_paths[i].clear(); planning_paths[i].push_back(env.curr_states[i]);
+                }
+                executed_step=0;
+            }
+        }""", "resync"),
+        ], "LORR_EXT_KITTY_RESYNC")
+        done.append("kitty resync")
     return done
 
 
@@ -243,9 +267,10 @@ def main() -> None:
     ap.add_argument("--nms-arrival-fix", action="store_true")
     ap.add_argument("--plan-ahead", action="store_true", help="2026 default planner: next errand inside the rollout")
     ap.add_argument("--pibt-reserve", type=int, default=None, help="2026 default planner: MIN_PIBT_TIME in ms")
+    ap.add_argument("--kitty-resync", action="store_true", help="Kitty_Knight: resync instead of exit on plan mismatch")
     a = ap.parse_args()
     print("patched:", ", ".join(patch(a.kit, a.kitty_guard, a.stale_task_guard, a.nms_arrival_fix, a.plan_ahead,
-                                      a.pibt_reserve)))
+                                      a.pibt_reserve, a.kitty_resync)))
 
 
 if __name__ == "__main__":

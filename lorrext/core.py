@@ -34,8 +34,9 @@ SOLVERS = {
     "default2026nx": dict(kit="lorr2026nx", gen="2026", scheduler="default", label="2026 default + plan-ahead"),
     # + 20 ms PIBT reserve; meant to run with a short window (core.WINDOW_MS), see E1
     "default2026g": dict(kit="lorr2026g", gen="2026", scheduler="default", label="2026 default + plan-ahead + guidance budget"),
+    "kitty2024rs": dict(kit="kitty2024rs", gen="2024", scheduler="default", label="Kitty_Knight + resync"),
 }
-RESEARCH_VARIANTS = {"nms2024fix", "default2026nx", "default2026g"}
+RESEARCH_VARIANTS = {"nms2024fix", "default2026nx", "default2026g", "kitty2024rs"}
 
 TICK_MS = 30      # 2026 kit: wall-clock per tick
 WINDOW_MS = 300   # 2026 kit: planner communication window

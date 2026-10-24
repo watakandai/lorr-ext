@@ -36,7 +36,7 @@ Both are patcher options (`tools/patch_kit.py`), built as separate solvers by `s
 | same | **2 ticks** | **0.588 (+32%)** | 144 |
 
 - **Plan-ahead is a small gain, so most of the latency is not errand transitions inside a window.** In the 2026 kit a busy robot covers only 2–3 cells per 10-tick window, so it rarely finishes an errand mid-window. The big cost is the window itself: a plan is computed from a predicted state and reaches the robots a full window later.
-- **A shorter window is the real fix, once guidance keeps its time.** PIBT for 100 robots needs about 1 ms per step; the kit's fixed 100 ms reserve is what forbids short windows. With a 20 ms reserve, a 2-tick window at real-time speed recovers 0.44 → 0.59, three quarters of the way to the 1-tick slow-clock result (0.65). Shorter windows cost more planning calls per tick, so the right window is the shortest one whose planning still finishes in time; it scales with fleet size.
+- **A shorter window is the real fix, once guidance keeps its time.** PIBT for 100 robots needs about 1 ms per step; the kit's fixed 100 ms reserve is what forbids short windows. With a 20 ms reserve, a 2-tick window at real-time speed recovers 0.44 → 0.59, about 70% of the way to the 1-tick slow-clock result (0.65). Shorter windows cost more planning calls per tick, so the right window is the shortest one whose planning still finishes in time; it scales with fleet size.
 
 ## What it means
 
