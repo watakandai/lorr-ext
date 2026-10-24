@@ -7,7 +7,8 @@
 //   slack   : least slack first, slack = deadline - (age + errand path +
 //             safe service), where safe service is a quantile (default 95th
 //             percentile) of the *known* service-time distribution of each
-//             remaining errand's cell
+//             remaining errand's cell, and deadline is the task's own
+//             (LorrExt::deadline_of: its deadline class, if classes are set)
 //
 // All baselines commit on assignment (no re-assignment of unopened tasks),
 // like the default, so differences come from the order alone.
@@ -53,7 +54,6 @@ bool plan(int time_limit, std::vector<int> &proposed_schedule, SharedEnvironment
 
     TimePoint endtime = std::chrono::steady_clock::now() + std::chrono::milliseconds(time_limit);
     const int now = env->curr_timestep;
-    const int D = LorrExt::cfg().deadline;
 
     std::unordered_set<int> assigned;
     std::vector<int> free_agents;
@@ -80,7 +80,7 @@ bool plan(int time_limit, std::vector<int> &proposed_schedule, SharedEnvironment
         if (name == "slack")
         {
             int age = now - t.t_revealed;
-            key = (long long)D - age - path_len(env, t, t.locations.front()) - safe_service(t);
+            key = (long long)LorrExt::deadline_of(t.task_id) - age - path_len(env, t, t.locations.front()) - safe_service(t);
         }
         order.emplace_back(key, kv.first);
     }

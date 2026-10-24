@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import cellmaps
+from . import cellmaps, instances
 
 ROOT = Path(__file__).resolve().parent.parent
 KITS = ROOT / "kits"
@@ -29,7 +29,14 @@ SOLVERS = {
     "default2024": dict(kit="default2024", gen="2024", scheduler="default", label="2024 default"),
     "nms2024": dict(kit="nms2024", gen="2024", scheduler="default", label="No Man's Sky (2024 1st)"),
     "kitty2024": dict(kit="kitty2024", gen="2024", scheduler="default", label="Kitty_Knight (2024 2nd, guarded)"),
+    # stage-5 variants (docs/research/proposals.md); not part of the default grids
+    "nms2024fix": dict(kit="nms2024fix", gen="2024", scheduler="default", label="No Man's Sky + arrival fix"),
+    "default2026nx": dict(kit="lorr2026nx", gen="2026", scheduler="default", label="2026 default + plan-ahead"),
+    # + 20 ms PIBT reserve; meant to run with a short window (core.WINDOW_MS), see E1
+    "default2026g": dict(kit="lorr2026g", gen="2026", scheduler="default", label="2026 default + plan-ahead + guidance budget"),
+    "kitty2024rs": dict(kit="kitty2024rs", gen="2024", scheduler="default", label="Kitty_Knight + resync"),
 }
+RESEARCH_VARIANTS = {"nms2024fix", "default2026nx", "default2026g", "kitty2024rs"}
 
 TICK_MS = 30      # 2026 kit: wall-clock per tick
 WINDOW_MS = 300   # 2026 kit: planner communication window
@@ -52,6 +59,12 @@ class Setting:
     burst_length: float = 50.0      # mmpp: mean burst length (ticks)
     branching: float = 0.6          # hawkes: offspring per task
     decay: float = 0.05             # hawkes: kernel decay per tick
+    # ---- realistic variants (docs/research); defaults = the competition setting
+    layout: str = "random"          # random | random_renamed | warehouse | sortation (lorrext/instances.py)
+    agents: int = 100               # fleet size
+    tasks: str = "official"         # official | uniform:a-b | g2p | sort | tour:k | trip:dmin
+    deadlines: str = ""             # per-task deadline classes "share:D,share:D", e.g. "0.2:100,0.8:400"
+    faults: str = ""                # robot faults / closures, "+"-joined, see faults_config()
 
     def key(self) -> str:
         svc = Path(self.service).stem if self.service.endswith(".json") else self.service.replace(":", "_")
@@ -67,7 +80,59 @@ class Setting:
                 s += f"_{f}{getattr(self, f):g}"
         if self.deadline != d.deadline:
             s += f"_D{self.deadline}"
+        if self.layout != d.layout:
+            s += f"_L{self.layout}"
+        if self.agents != d.agents:
+            s += f"_A{self.agents}"
+        if self.tasks != d.tasks:
+            s += "_K" + self.tasks.replace(":", "-")
+        if self.deadlines:
+            s += "_DC" + self.deadlines.replace(":", "-").replace(",", "_")
+        if self.faults:
+            s += "_F" + self.faults.replace(":", "-").replace("@", "at")
         return s
+
+
+def deadline_config(spec: str, seed: int) -> dict | None:
+    """'0.2:100,0.8:400' -> {"classes": [{"share": 0.2, "D": 100}, ...], "seed": seed}."""
+    if not spec:
+        return None
+    classes = [{"share": float(a), "D": int(b)} for a, b in (x.split(":") for x in spec.split(","))]
+    return {"classes": classes, "seed": seed}
+
+
+def faults_config(spec: str, layout: str, seed: int) -> dict | None:
+    """'+'-joined fault terms -> the lorrExt "faults" block:
+        bd<p>:<dist>        breakdowns: each tick a working robot fails with probability p and
+                            stays frozen for a repair time ~ dist (cellmaps.parse_dist), e.g. bd0.0005:50-150
+        slow<share>x<k>     a share of robots act only every k-th tick, e.g. slow0.2x2
+        pause<every>x<len>  every robot pauses len ticks every `every` ticks (phase per robot)
+        close<set>@<a>-<b>  the cells of a named set (instances.closure_cells) are closed in [a, b)
+        stopall             the 2024 kit's rule instead of a local safety stop: if any robot
+                            besides the frozen ones must be stopped, every robot waits
+    """
+    if not spec:
+        return None
+    f: dict = {"seed": seed}
+    for term in spec.split("+"):
+        if term.startswith("bd"):
+            p, dist = term[2:].split(":", 1)
+            f["breakdown"] = {"p": float(p), **cellmaps.parse_dist(dist)}
+        elif term.startswith("slow"):
+            share, k = term[4:].split("x")
+            f["slow"] = {"share": float(share), "period": int(k)}
+        elif term.startswith("pause"):
+            every, length = term[5:].split("x")
+            f["pause"] = {"every": int(every), "length": int(length)}
+        elif term.startswith("close"):
+            name, span = term[5:].split("@")
+            a, b = (int(x) for x in span.split("-"))
+            f.setdefault("closures", []).append({"cells": instances.closure_cells(layout, name), "from": a, "to": b})
+        elif term == "stopall":
+            f["stop"] = "all"
+        else:
+            raise ValueError(f"unknown fault term {term!r}")
+    return f
 
 
 def arrival_config(s: Setting) -> dict:
@@ -80,31 +145,41 @@ def arrival_config(s: Setting) -> dict:
 
 
 def write_instance(s: Setting, scheduler: str, out_dir: Path) -> Path:
-    """Instance JSON next to symlinks of the base map/agents/tasks."""
+    """Instance JSON next to symlinks of the map/agents/tasks directories it uses."""
+    info = instances.prepare(s.layout, s.agents, s.tasks, s.seed)
+    if info["dir"] != BASE:  # generated layouts get their own folder of symlinks
+        out_dir = out_dir / f"gen-{s.layout}"
     out_dir.mkdir(parents=True, exist_ok=True)
     for sub in ("maps", "agents", "tasks"):
         link = out_dir / sub
         try:
-            link.symlink_to(BASE / sub)
+            link.symlink_to(info["dir"] / sub)
         except FileExistsError:
             pass
+    free = instances.free(s.layout)
+    ch = instances.chars(s.layout)
     arrival = arrival_config(s)
+    ext = {"arrival": arrival,
+           "mapCols": free.shape[1],
+           "service": {**(cellmaps.build(s.service, "service", free, s.seed, ch) or {}), "seed": s.seed},
+           "delay": {**(cellmaps.build(s.delay, "delay", free, s.seed, ch) or {}), "seed": s.seed},
+           "deadline": s.deadline, "scheduler": scheduler}
+    if s.deadlines:
+        ext["deadlines"] = deadline_config(s.deadlines, s.seed)
+    if s.faults:
+        ext["faults"] = faults_config(s.faults, s.layout, s.seed)
     inst = {
-        "mapFile": "maps/random-32-32-20.map",
-        "agentFile": "agents/random_32_32_20_100.agents",
-        "teamSize": 100,
-        "taskFile": "tasks/random_32_32_20_official.tasks",
+        "mapFile": info["mapFile"],
+        "agentFile": info["agentFile"],
+        "teamSize": s.agents,
+        "taskFile": info["taskFile"],
         "numTasksReveal": s.pool_reveal,
         "agentCounter": 1,
         "agentSize": 1.0,
         "delayConfig": {"seed": s.seed, "minDelay": 1, "maxDelay": 4, "eventModel": "bernoulli",
                         "pDelay": s.p_delay, "durationModel": "uniform",
                         "gaussMeanRatio": 0.5, "gaussStdRatio": 0.22},
-        "lorrExt": {"arrival": arrival,
-                    "mapCols": FREE.shape[1],
-                    "service": {**(cellmaps.build(s.service, "service", FREE, s.seed) or {}), "seed": s.seed},
-                    "delay": {**(cellmaps.build(s.delay, "delay", FREE, s.seed) or {}), "seed": s.seed},
-                    "deadline": s.deadline, "scheduler": scheduler},
+        "lorrExt": ext,
     }
     p = out_dir / f"{s.key()}_{scheduler}.json"
     p.write_text(json.dumps(inst, indent=1))
@@ -126,6 +201,9 @@ def run_kit(solver: str, inst: Path, out: Path, steps: int, screen: int = 3, tim
         cmd += ["-t", str(PLAN_MS)]
     if cpus:  # pin to dedicated cores (No Man's Sky alone spawns ~10 threads)
         cmd = ["taskset", "-c", cpus] + cmd
+    if os.environ.get("LORREXT_MEM"):  # per-run memory cap, so one runaway run can't take the grid down
+        cmd = ["systemd-run", "--user", "--scope", "-q", "-p", f"MemoryMax={os.environ['LORREXT_MEM']}",
+               "-p", "MemorySwapMax=0"] + cmd
     try:
         cp = subprocess.run(cmd, cwd=kit, capture_output=True, text=True, timeout=timeout,
                             env={**os.environ, "OMP_NUM_THREADS": "1"})
@@ -153,7 +231,9 @@ def run(solver: str, s: Setting, out_dir: Path, screen: int = 3, timeout: int = 
     row = {"solver": solver, **asdict(s), "cpus": cpus, "returncode": rc, "wall_s": round(time.time() - t0, 1), "output": str(out)}
     if out.exists():
         js = json.loads(out.read_text())
-        row.update(metrics(js, s.deadline, cellmaps.per_cell(cellmaps.build(s.service, "service", FREE, s.seed), FREE)))
+        free = instances.free(s.layout)
+        svc = cellmaps.build(s.service, "service", free, s.seed, instances.chars(s.layout))
+        row.update(metrics(js, s.deadline, cellmaps.per_cell(svc, free), s))
         # per-task records (id, reveal, done, agent, stops) for task-level diffs
         (out_dir / "tasks").mkdir(exist_ok=True)
         np.save(out_dir / "tasks" / f"{tag}.npy", np.array(js["lorrExt"]["tasks"], dtype=np.int32).reshape(-1, 5))
@@ -204,18 +284,32 @@ def bfs_from(src: int) -> dict:
     return d
 
 
-def task_length(task_id: int) -> int:
+def _task_errands(s: "Setting | None") -> list[list[int]]:
+    g = _geometry()  # also initialises the distance cache that task_length uses
+    if s is None or (s.layout == "random" and s.tasks == "official"):
+        return g["tasks"]
+    key = (s.layout, s.tasks, s.seed)
+    if key not in _GEOM.setdefault("variants", {}):
+        _GEOM["variants"][key] = instances.task_list(s.layout, s.tasks, s.seed)
+    return _GEOM["variants"][key]
+
+
+def task_length(task_id: int, s: "Setting | None" = None) -> int:
     """Intrinsic travel of a task: moves from its first errand through the rest."""
-    locs = _geometry()["tasks"][task_id % len(_geometry()["tasks"])]
-    return sum(bfs_from(a).get(b, 0) for a, b in zip(locs, locs[1:]))
+    tasks = _task_errands(s)
+    locs = tasks[task_id % len(tasks)]
+    if s is None or s.layout == "random":
+        return sum(bfs_from(a).get(b, 0) for a, b in zip(locs, locs[1:]))
+    return sum(max(0, instances.dist(s.layout, a, b)) for a, b in zip(locs, locs[1:]))
 
 
-def expected_service(task_id: int, svc_grid: np.ndarray | None) -> float:
+def expected_service(task_id: int, svc_grid: np.ndarray | None, s: "Setting | None" = None) -> float:
     """Expected total service time of a task from the per-cell mean grid."""
     if svc_grid is None:
         return 0.0
     w = svc_grid.shape[1]
-    locs = _geometry()["tasks"][task_id % len(_geometry()["tasks"])]
+    tasks = _task_errands(s)
+    locs = tasks[task_id % len(tasks)]
     return float(sum(np.nan_to_num(svc_grid[v // w, v % w]) for v in locs))
 
 
@@ -252,7 +346,38 @@ def deadline_metrics(tt: np.ndarray, T: int) -> dict:
     return out
 
 
-def metrics(js: dict, deadline: int, svc_grid: np.ndarray | None = None) -> dict:
+def class_metrics(js: dict) -> dict:
+    """Per deadline class: share of tasks and miss rate (tasks revealed in [0.1T, T-D_k];
+    open tasks count as misses)."""
+    ext = js["lorrExt"]
+    if "taskClass" not in ext:
+        return {}
+    T = ext["simulationTime"]
+    tt = task_table(js)
+    cls = np.array(ext["taskClass"])
+    out = {}
+    for k, c in enumerate(ext["deadlineClasses"]):
+        D = c["D"]
+        sel = (cls == k) & (tt[:, 0] >= 0.1 * T) & (tt[:, 0] <= T - D)
+        lat = np.where(tt[sel, 1] >= 0, tt[sel, 1] - tt[sel, 0], np.inf)
+        out[f"class{k}_D"] = D
+        out[f"class{k}_n"] = int(sel.sum())
+        out[f"class{k}_miss"] = float((lat > D).mean()) if sel.any() else float("nan")
+        out[f"class{k}_p90"] = float(np.percentile(lat, 90, method="higher")) if sel.any() else float("nan")
+    return out
+
+
+def fault_metrics(js: dict) -> dict:
+    f = js["lorrExt"].get("faults")
+    if not f:
+        return {}
+    bd = np.array(f["breakdowns"]).reshape(-1, 3)
+    return {"breakdowns": int(len(bd)), "breakdown_ticks": int(bd[:, 2].sum()) if len(bd) else 0,
+            "slow_robots": len(f["slowRobots"]), "frozen_waits": f["frozenWaits"],
+            "closure_waits": f["closureWaits"], "cascade_waits": f["cascadeWaits"], "all_stops": f["allStops"]}
+
+
+def metrics(js: dict, deadline: int, svc_grid: np.ndarray | None = None, s: "Setting | None" = None) -> dict:
     T = js["lorrExt"]["simulationTime"]
     lat, open_ = latencies(js)
     tt = task_table(js)
@@ -264,7 +389,7 @@ def metrics(js: dict, deadline: int, svc_grid: np.ndarray | None = None) -> dict
     worst = np.sort(lat)[-max(1, int(np.ceil(0.05 * len(lat)))):] if len(lat) else np.array([np.nan])
     # normalised latency: latency / (own errand-to-errand travel + expected service)
     recs = [r for r in js["lorrExt"]["tasks"] if r[1] >= 0.1 * T]
-    ideal = np.array([max(1.0, task_length(r[0]) + expected_service(r[0], svc_grid)) for r in recs])
+    ideal = np.array([max(1.0, task_length(r[0], s) + expected_service(r[0], svc_grid, s)) for r in recs])
     stretch = lat / ideal if len(lat) == len(ideal) and len(lat) else np.array([np.nan])
     # time-averaged number of open tasks over the scored window
     ts = np.arange(int(0.1 * T), T)
@@ -284,4 +409,6 @@ def metrics(js: dict, deadline: int, svc_grid: np.ndarray | None = None) -> dict
         **deadline_metrics(tt, T),
         "planner_errors": js.get("numPlannerErrors"), "schedule_errors": js.get("numScheduleErrors"),
         "timeouts": js.get("numEntryTimeouts"),
+        "throughput_per_robot": js["numTaskFinished"] / T / max(1, js.get("teamSize", 100)),
+        **class_metrics(js), **fault_metrics(js),
     }

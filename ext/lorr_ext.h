@@ -11,6 +11,8 @@
 //                                                    its next errand" test
 //   CompetitionSystem  LorrExt::save(...)            inside saveResults
 //   Simulator.cpp      LorrExt::simulate_delay(...)  2026 kit only
+//                      LorrExt::filter_actions(...)  both kits: robot faults,
+//                                                    closed cells, safety stop
 // With no "lorrExt" object in the input JSON every hook is a no-op and the kit
 // behaves exactly as released.
 //
@@ -155,6 +157,38 @@ struct LorrExtConfig
     int delayDefault = -1;
     uint64_t delaySeed = 0;
 
+    // ---- per-task deadlines -----------------------------------------------
+    // Task i belongs to class k with probability share_k (a hash of seed and
+    // task id, so every solver sees the same classes) and must finish within
+    // D_k ticks of its reveal. No classes: every task has `deadline`.
+    struct DeadlineClass { double share = 1; int D = 300; };
+    std::vector<DeadlineClass> deadlineClasses;
+    uint64_t deadlineSeed = 0;
+
+    // ---- robot availability and closed cells (both kits) -------------------
+    // A robot is *frozen* in a tick when it is broken down, is a slow robot on
+    // one of its off ticks, or is in a scheduled pause; a frozen robot's action
+    // becomes a wait. A forward move into a closed cell becomes a wait too.
+    // Planners are not told. Then a local safety stop: a robot moving forward
+    // into a cell whose occupant is not moving forward waits as well
+    // (repeated until nothing changes), so no collision can result. With
+    // stopAll the kit's 2024 rule is used instead: if any robot other than
+    // the frozen ones had to be stopped, every robot waits this tick.
+    struct Closure { std::vector<int> cells; int from = 0, to = 0; };
+    struct Faults
+    {
+        bool on = false;
+        double breakdownP = 0;       // per tick, per robot that is not broken
+        ServiceDist repair;          // breakdown length in ticks
+        double slowShare = 0;        // share of robots that are slow
+        int slowPeriod = 2;          // a slow robot acts once every slowPeriod ticks
+        int pauseEvery = 0;          // scheduled pause every pauseEvery ticks (0 = none)
+        int pauseLength = 0;         // ... lasting pauseLength ticks, phase by robot
+        std::vector<Closure> closures;
+        bool stopAll = false;
+        uint64_t seed = 0;
+    } faults;
+
     // ---- metrics / baselines --------------------------------------------
     int deadline = 300;              // informational; analysis can re-threshold
     std::string scheduler = "default"; // 2026-kit baseline selector
@@ -184,6 +218,11 @@ struct LorrExt
         std::vector<int> delay_loc;   // cell at the previous delay roll (-1 = none yet)
         int delay_tick = 0;
         std::vector<std::array<int, 3>> delay_events; // (agent, start tick, length)
+        // robot faults
+        std::vector<int> broken_until;  // first tick the robot works again
+        int fault_tick = -1;            // last tick whose breakdowns were rolled
+        std::vector<std::array<int, 3>> breakdown_events; // (agent, start tick, length)
+        long long frozen_waits = 0, closure_waits = 0, cascade_waits = 0, all_stops = 0;
     };
     static State &st()
     {
@@ -290,6 +329,45 @@ struct LorrExt
                 }
             c.delaySeed = get(dl, "seed", c.delaySeed);
         }
+        // "deadlines": {"classes": [{"share": 0.2, "D": 100}, {"share": 0.8, "D": 400}], "seed": 0}
+        if (j.contains("deadlines"))
+        {
+            const auto &dd = j["deadlines"];
+            if (dd.contains("classes"))
+                for (const auto &k : dd["classes"])
+                    c.deadlineClasses.push_back({get(k, "share", 1.0), get(k, "D", 300)});
+            c.deadlineSeed = get(dd, "seed", c.deadlineSeed);
+        }
+        // "faults": {"breakdown": {"p": 0.0005, "dist": "uniform", "lo": 50, "hi": 150},
+        //            "slow": {"share": 0.2, "period": 2}, "pause": {"every": 300, "length": 30},
+        //            "closures": [{"cells": [[r, c], ...], "from": 200, "to": 600}],
+        //            "stop": "local" | "all", "seed": 0}
+        if (j.contains("faults"))
+        {
+            const auto &fj = j["faults"];
+            auto &f = c.faults;
+            f.on = true;
+            if (fj.contains("breakdown"))
+            {
+                f.breakdownP = get(fj["breakdown"], "p", 0.0);
+                f.repair = parse_dist(fj["breakdown"]);
+            }
+            if (fj.contains("slow"))
+            {
+                f.slowShare = get(fj["slow"], "share", 0.0);
+                f.slowPeriod = std::max(1, get(fj["slow"], "period", 2));
+            }
+            if (fj.contains("pause"))
+            {
+                f.pauseEvery = get(fj["pause"], "every", 0);
+                f.pauseLength = get(fj["pause"], "length", 0);
+            }
+            if (fj.contains("closures"))
+                for (const auto &cl : fj["closures"])
+                    f.closures.push_back({cells_of(cl), get(cl, "from", 0), get(cl, "to", 1 << 30)});
+            f.stopAll = get(fj, "stop", std::string("local")) == "all";
+            f.seed = get(fj, "seed", f.seed);
+        }
         c.deadline = get(j, "deadline", c.deadline);
         c.scheduler = get(j, "scheduler", c.scheduler);
         st().rng.seed(c.arrivalSeed * 0x9E3779B97F4A7C15ULL + 12345);
@@ -335,6 +413,153 @@ struct LorrExt
     {
         x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL; x ^= x >> 33;
         return x;
+    }
+
+    // ---- per-task deadlines -----------------------------------------------
+    static int deadline_class(int task_id)
+    {
+        const auto &c = cfg();
+        if (c.deadlineClasses.empty())
+            return 0;
+        double u = (mix(c.deadlineSeed * 0x9E3779B97F4A7C15ULL ^ (uint64_t(task_id) + 0x51ED)) >> 11) * (1.0 / 9007199254740992.0);
+        double total = 0;
+        for (auto &k : c.deadlineClasses)
+            total += k.share;
+        double acc = 0;
+        for (size_t k = 0; k < c.deadlineClasses.size(); k++)
+        {
+            acc += c.deadlineClasses[k].share / total;
+            if (u < acc)
+                return int(k);
+        }
+        return int(c.deadlineClasses.size()) - 1;
+    }
+    static int deadline_of(int task_id)
+    {
+        const auto &c = cfg();
+        return c.deadlineClasses.empty() ? c.deadline : c.deadlineClasses[deadline_class(task_id)].D;
+    }
+
+    // ---- robot faults and closed cells (both kits) -----------------------
+    static double unit(uint64_t x) { return (mix(x) >> 11) * (1.0 / 9007199254740992.0); }
+    static bool is_slow(int a)
+    {
+        const auto &f = cfg().faults;
+        return f.slowShare > 0 && unit(f.seed * 0x9E3779B97F4A7C15ULL ^ (uint64_t(a) << 8) ^ 0x5105) < f.slowShare;
+    }
+    static bool cell_closed(int cell, int t)
+    {
+        for (const auto &cl : cfg().faults.closures)
+            if (t >= cl.from && t < cl.to && std::find(cl.cells.begin(), cl.cells.end(), cell) != cl.cells.end())
+                return true;
+        return false;
+    }
+    // Rolls breakdowns for every tick up to t (once per tick, independent of
+    // how often the simulator calls in), from a hash of (seed, robot, tick).
+    static void advance_breakdowns(int n, int t)
+    {
+        const auto &f = cfg().faults;
+        auto &s = st();
+        if ((int)s.broken_until.size() != n)
+            s.broken_until.assign(n, 0);
+        for (int u = s.fault_tick + 1; u <= t; u++)
+            for (int a = 0; a < n && f.breakdownP > 0; a++)
+            {
+                if (s.broken_until[a] > u)
+                    continue;
+                std::mt19937_64 g(mix(f.seed * 0x9E3779B97F4A7C15ULL ^ (uint64_t(a) << 32) ^ uint64_t(u) ^ 0xB4EA4ULL));
+                if (std::uniform_real_distribution<double>(0, 1)(g) < f.breakdownP)
+                {
+                    int len = std::max(1, f.repair.draw(g));
+                    s.broken_until[a] = u + len;
+                    s.breakdown_events.push_back({a, u, len});
+                }
+            }
+        s.fault_tick = std::max(s.fault_tick, t);
+    }
+    static bool frozen(int a, int t)
+    {
+        const auto &f = cfg().faults;
+        const auto &s = st();
+        if (a < (int)s.broken_until.size() && s.broken_until[a] > t)
+            return true;
+        if (f.slowShare > 0 && is_slow(a) && (t + a) % f.slowPeriod != 0)
+            return true;
+        if (f.pauseEvery > 0 && f.pauseLength > 0)
+        {
+            int phase = int(mix(f.seed ^ (uint64_t(a) * 0x9E37ULL)) % uint64_t(f.pauseEvery));
+            if ((t + phase) % f.pauseEvery < f.pauseLength)
+                return true;
+        }
+        return false;
+    }
+
+    // Hook just before a tick's actions are validated (2024 kit) or applied
+    // (2026 kit). Rewrites actions in place; never makes a valid joint action
+    // invalid. Orientation: 0 east, 1 south, 2 west, 3 north.
+    template <class S, class A>
+    static void filter_actions(const std::vector<S> &states, std::vector<A> &actions, int t)
+    {
+        auto &c = cfg();
+        if (!c.enabled || !c.faults.on)
+            return;
+        auto &s = st();
+        const int n = (int)states.size();
+        if ((int)actions.size() < n)
+            actions.resize(n, A::W);
+        advance_breakdowns(n, t);
+        const int cols = c.mapCols;
+        auto ahead = [&](int a) {
+            const int d[4] = {1, cols, -1, -cols};
+            return states[a].location + d[((states[a].orientation % 4) + 4) % 4];
+        };
+        bool any_frozen = false, any_blocked = false;
+        for (int a = 0; a < n; a++)
+            if (frozen(a, t))
+            {
+                any_frozen = true;
+                if (actions[a] != A::W)
+                {
+                    actions[a] = A::W;
+                    s.frozen_waits++;
+                }
+            }
+        if (!c.faults.closures.empty())
+            for (int a = 0; a < n; a++)
+                if (actions[a] == A::FW && cell_closed(ahead(a), t))
+                {
+                    actions[a] = A::W;
+                    s.closure_waits++;
+                    any_blocked = true;
+                }
+        if (!any_frozen && !any_blocked)
+            return;
+        std::unordered_map<int, int> occ;
+        occ.reserve(2 * n);
+        for (int a = 0; a < n; a++)
+            occ[states[a].location] = a;
+        bool changed = true;
+        while (changed)
+        {
+            changed = false;
+            for (int a = 0; a < n; a++)
+            {
+                if (actions[a] != A::FW)
+                    continue;
+                auto it = occ.find(ahead(a));
+                if (it != occ.end() && it->second != a && actions[it->second] != A::FW)
+                {
+                    actions[a] = A::W;
+                    s.cascade_waits++;
+                    any_blocked = changed = true;
+                }
+            }
+        }
+        if (c.faults.stopAll && any_blocked)
+        {
+            std::fill(actions.begin(), actions.end(), A::W);
+            s.all_stops++;
+        }
     }
 
     // ---- per-cell move delays (2026 kit) --------------------------------
@@ -524,6 +749,37 @@ struct LorrExt
         for (auto &e : st().delay_events)
             ev.push_back({e[0], e[1], e[2]});
         ext["delayEvents"] = ev; // [agent, start tick, length]
+        if (!c.deadlineClasses.empty())
+        {
+            nlohmann::ordered_json dc = nlohmann::ordered_json::array();
+            for (auto &k : c.deadlineClasses)
+                dc.push_back({{"share", k.share}, {"D", k.D}});
+            ext["deadlineClasses"] = dc;
+            nlohmann::ordered_json tcls = nlohmann::ordered_json::array();
+            for (auto *t : tm.all_tasks)
+                tcls.push_back(deadline_class(t->task_id));
+            ext["taskClass"] = tcls; // aligned with "tasks"
+        }
+        if (c.faults.on)
+        {
+            const auto &s = st();
+            nlohmann::ordered_json fo;
+            nlohmann::ordered_json bev = nlohmann::ordered_json::array();
+            for (auto &e : s.breakdown_events)
+                bev.push_back({e[0], e[1], e[2]});
+            fo["breakdowns"] = bev; // [agent, start tick, length]
+            nlohmann::ordered_json slow = nlohmann::ordered_json::array();
+            for (int a = 0; a < (int)s.broken_until.size(); a++)
+                if (is_slow(a))
+                    slow.push_back(a);
+            fo["slowRobots"] = slow;
+            fo["frozenWaits"] = s.frozen_waits;
+            fo["closureWaits"] = s.closure_waits;
+            fo["cascadeWaits"] = s.cascade_waits;
+            fo["allStops"] = s.all_stops;
+            fo["stop"] = c.faults.stopAll ? "all" : "local";
+            ext["faults"] = fo;
+        }
         // [task_id, t_revealed, t_completed (-1 = open), agent, n_stops]
         nlohmann::ordered_json recs = nlohmann::ordered_json::array();
         for (auto *t : tm.all_tasks)
