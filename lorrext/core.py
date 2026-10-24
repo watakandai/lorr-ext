@@ -27,6 +27,8 @@ SOLVERS = {
     "fifo2026": dict(kit="lorr2026", gen="2026", scheduler="fifo", label="oldest-first"),
     "slack2026": dict(kit="lorr2026", gen="2026", scheduler="slack", label="least-slack"),
     "default2024": dict(kit="default2024", gen="2024", scheduler="default", label="2024 default"),
+    # B1 root-cause test: planner told which robots are frozen (tools/patch_kit.py --fault-aware)
+    "default2024fa": dict(kit="default2024fa", gen="2024", scheduler="default", label="2024 default + fault-aware"),
     "nms2024": dict(kit="nms2024", gen="2024", scheduler="default", label="No Man's Sky (2024 1st)"),
     "kitty2024": dict(kit="kitty2024", gen="2024", scheduler="default", label="Kitty_Knight (2024 2nd, guarded)"),
     # stage-5 variants (docs/research/proposals.md); not part of the default grids
@@ -36,7 +38,7 @@ SOLVERS = {
     "default2026g": dict(kit="lorr2026g", gen="2026", scheduler="default", label="2026 default + plan-ahead + guidance budget"),
     "kitty2024rs": dict(kit="kitty2024rs", gen="2024", scheduler="default", label="Kitty_Knight + resync"),
 }
-RESEARCH_VARIANTS = {"nms2024fix", "default2026nx", "default2026g", "kitty2024rs"}
+RESEARCH_VARIANTS = {"nms2024fix", "default2024fa", "default2026nx", "default2026g", "kitty2024rs"}
 
 TICK_MS = 30      # 2026 kit: wall-clock per tick
 WINDOW_MS = 300   # 2026 kit: planner communication window

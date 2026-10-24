@@ -89,7 +89,8 @@ namespace DefaultPlanner {
 
 
 def patch(kit: Path, kitty_guard: bool = False, stale_guard: bool = False, nms_arrival_fix: bool = False,
-          plan_ahead: bool = False, pibt_reserve: int | None = None, kitty_resync: bool = False) -> list[str]:
+          plan_ahead: bool = False, pibt_reserve: int | None = None, kitty_resync: bool = False,
+          fault_aware: bool = False) -> list[str]:
     done = []
     shutil.copy(EXT / "lorr_ext.h", kit / "inc" / "lorr_ext.h")
 
@@ -256,6 +257,61 @@ def patch(kit: Path, kitty_guard: bool = False, stale_guard: bool = False, nms_a
         }""", "resync"),
         ], "LORR_EXT_KITTY_RESYNC")
         done.append("kitty resync")
+    if fault_aware:
+        # Tests the B1 hypothesis (docs/research/B1_breakdowns.md): breakdowns cost far more
+        # than the frozen time because the planner does not know a robot is frozen. Every tick
+        # PIBT plans the frozen robot as moving and plans robots behind it into the cell it
+        # "vacates"; the simulator's local safety stop then cancels those moves too (the
+        # cascade waits, 2.7-3.7x the frozen time). This variant tells the planner which robots
+        # are stopped (broken down, a slow robot's off tick, a pause), the way a real fleet
+        # manager knows a robot reported a fault, and plans them as staying put, so PIBT routes
+        # the others around them. If the hypothesis holds, cascade waits and most of the loss
+        # disappear.
+        patch_file(kit / "default_planner" / "planner.cpp", [
+            (r'(#include\s+"planner.h")', r'\1\n#include "lorr_ext.h"', "include"),
+            # Inserted just before PIBT runs, after the planner has rebuilt this tick's
+            # `decision` table (cell -> robot that claims it) and `decided` (each robot's
+            # committed target cell, NOT_DONE while it is still turning towards it).
+            (r"(\n(\s*)// compute the targeted next location for each agent using PIBT)",
+             r"""
+\2// LoRR-Ext fault-aware: a frozen robot will not move this tick, so plan it as staying put.
+\2// A robot keeps a committed target cell (decided NOT_DONE) over several ticks while it
+\2// turns, and one whose move was blocked keeps it too, so a broken robot usually has one.
+\2// Robots behind it may in turn be committed to the cell it was going to vacate. Pinning
+\2// the frozen robot alone left those commitments pointing into its cell, and two robots
+\2// later swapped cells (an edge conflict: the 2024 kit then stops every robot, here
+\2// forever). So we cancel, transitively, every commitment into a cell whose robot now
+\2// stays, and let PIBT replan those robots together with the free ones.
+\2std::vector<char> lorrext_stays(env->num_of_agents, 0);
+\2for (int i : ids)
+\2    lorrext_stays[i] = LorrExt::frozen(i, env->curr_timestep);
+\2for (bool changed = true; changed;) {
+\2    changed = false;
+\2    for (int j : ids) {
+\2        if (lorrext_stays[j] || decided[j].state != DONE::NOT_DONE) continue;
+\2        int k = prev_decision.at(decided[j].loc); // robot standing in j's target cell
+\2        if (k < 0 || !lorrext_stays[k]) continue;
+\2        // cancel j's commitment: PIBT replans robots whose next_states is unset
+\2        if (decision.at(decided[j].loc) == j) decision.at(decided[j].loc) = -1;
+\2        decided[j] = DCR({prev_states[j].location, DONE::DONE});
+\2        next_states[j] = State();
+\2        // j may now have to stay too, so robots committed into j's cell are released next
+\2        lorrext_stays[j] = 1;
+\2        changed = true;
+\2    }
+\2}
+\2for (int i : ids) {
+\2    if (!LorrExt::frozen(i, env->curr_timestep)) continue;
+\2    // drop the frozen robot's own commitment; it resumes planning once it is unfrozen
+\2    if (decided[i].state == DONE::NOT_DONE && decision.at(decided[i].loc) == i) decision.at(decided[i].loc) = -1;
+\2    decided[i] = DCR({prev_states[i].location, DONE::DONE});
+\2    // fix its next cell to its current cell: PIBT skips robots whose next_states is set
+\2    // and treats the claimed cell as occupied, so nobody is planned into it
+\2    next_states[i] = State(prev_states[i].location, -1, -1);
+\2    decision.at(prev_states[i].location) = i;
+\2}\1""", "fault-aware"),
+        ], "LORR_EXT_FAULT_AWARE")
+        done.append("fault-aware")
     return done
 
 
@@ -268,9 +324,10 @@ def main() -> None:
     ap.add_argument("--plan-ahead", action="store_true", help="2026 default planner: next errand inside the rollout")
     ap.add_argument("--pibt-reserve", type=int, default=None, help="2026 default planner: MIN_PIBT_TIME in ms")
     ap.add_argument("--kitty-resync", action="store_true", help="Kitty_Knight: resync instead of exit on plan mismatch")
+    ap.add_argument("--fault-aware", action="store_true", help="2024 default planner: plan stopped robots as staying")
     a = ap.parse_args()
     print("patched:", ", ".join(patch(a.kit, a.kitty_guard, a.stale_task_guard, a.nms_arrival_fix, a.plan_ahead,
-                                      a.pibt_reserve, a.kitty_resync)))
+                                      a.pibt_reserve, a.kitty_resync, a.fault_aware)))
 
 
 if __name__ == "__main__":
